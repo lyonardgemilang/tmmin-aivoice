@@ -1,0 +1,17 @@
+transformers[torch]
+datasets
+ctranslate2
+scipy
+librosa
+sounddevice
+noisereduce
+numpy==2.1
+pyaudio
+SpeechRecognition
+pygame
+python-dotenv
+pyserial
+faster-whisper
+vosk
+pywifi
+comtypes
