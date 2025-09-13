@@ -8,7 +8,6 @@ sherpa_onnx
 under_development
 .env
 download.py
-main_old.py
 main_onnx.py
 recorded_audio.wav
 recorded_audiooo.wav
