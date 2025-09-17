@@ -4,11 +4,11 @@
 <h2>
   Feature
 </h2>
-<li>
-  <ol>
+<ol>
+  <li>
     Ambient Light
-  </ol>
-  <ol>
+  </li>
+  <li>
     SOP Digital
-  </ol>
-</li>
+  </li>
+</ol>
