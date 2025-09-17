@@ -14,5 +14,6 @@ rekaman.wav
 tes.py
 try_whisper_turbo.py
 wav2vec_try.py
-main.py
 nlp
+.venv
+main.py
