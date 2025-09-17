@@ -1,12 +1,17 @@
 import numpy as np
+import hailo_platform as hpf
 
-try:
-    import hailo_platform as hpf  # pyHailoRT
-except Exception as e:
-    raise RuntimeError(
-        "pyHailoRT not found. Install HailoRT and ensure the Python bindings are on PYTHONPATH."
-    ) from e
+# try:
+#     import hailo_platform as hpf  # pyHailoRT
+# except Exception as e:
+#     raise RuntimeError(
+#         "pyHailoRT not found. Install HailoRT and ensure the Python bindings are on PYTHONPATH."
+#     ) from e
+DEBUG_HAILO = True
 
+def _np_c(a):
+    """Make C-contiguous float32 array."""
+    return np.require(a, dtype=np.float32, requirements=["C"])
 
 class HailoWhisperEncoder:
     """
@@ -35,7 +40,6 @@ class HailoWhisperEncoder:
         )
         self.device = hpf.VDevice(params=vdev_params)
 
-        # Interface: Raspberry Pi 5 AI HAT and PCIe cards use PCIe
         if interface is None:
             interface = hpf.HailoStreamInterface.PCIe
 
@@ -57,7 +61,6 @@ class HailoWhisperEncoder:
             self.network_group, quantized=False, format_type=fmt
         )
 
-        # Helpful prints once, so you can confirm shapes without digging into HEF
         print(f"[HailoWhisperEncoder] Input stream:  {self.in_info.name},  shape={tuple(self.in_info.shape)}, dtype=float32")
         print(f"[HailoWhisperEncoder] Output stream: {self.out_info.name}, shape={tuple(self.out_info.shape)}, dtype=float32")
 
@@ -74,7 +77,7 @@ class HailoWhisperEncoder:
     #         raise ValueError(f"Expected mel features of shape (1,80,T). Got {x.shape}.")
     #     x = x[0]  # now (80, T)
 
-    #     fshape = tuple(self.in_info.shape)  # HEF frame shape (no batch)
+    #     fshape = tuple(self.in_info.shape)
 
     #     # Case A: (80, T)
     #     if len(fshape) == 2:
@@ -100,85 +103,68 @@ class HailoWhisperEncoder:
     #     return np.expand_dims(frame, axis=0).astype(np.float32, copy=False)
     def _prepare_input_frame(self, mel_1x80xT: np.ndarray) -> np.ndarray:
         """
-        Accepts (1,80,T). HEF may want any of:
-        (80,T), (T,80), (80,T,1), (1,80,T), (1,T,80), (1,80,T,1)
-        We reshape/transposes accordingly and always return (batch=1, ...) for VStreams.
+        Accept (1,80,T) float32 and return an array whose shape is EXACTLY
+        self.in_info.shape, with C-contiguous memory.
+        Handles common layouts: (80,T), (T,80), (80,T,1), (T,80,1), (1,80,T),
+        (1,T,80), (1,80,T,1), (1,T,80,1). Never adds extra batch unless target has it.
         """
-        x = mel_1x80xT
-        if x.dtype != np.float32:
-            x = x.astype(np.float32, copy=False)
-        if x.ndim != 3 or x.shape[0] != 1:
-            raise ValueError(f"Expected mel shape (1,80,T), got {x.shape}.")
+        if mel_1x80xT.ndim != 3 or mel_1x80xT.shape[0] != 1:
+            raise ValueError(f"Expected mel shape (1,80,T), got {mel_1x80xT.shape}")
+        if mel_1x80xT.dtype != np.float32:
+            mel_1x80xT = mel_1x80xT.astype(np.float32, copy=False)
 
-        # drop batch for matching
-        x = x[0]  # (80, T)
-        T = x.shape[1]
-        fshape = tuple(self.in_info.shape)
+        target = tuple(self.in_info.shape)
+        x80T = mel_1x80xT[0]                  # (80, T)
+        T = x80T.shape[1]
 
-        def add_batch(arr):
-            return np.expand_dims(arr, 0).astype(np.float32, copy=False)
+        # Candidate tensors (no extra expand unless needed)
+        candidates = [
+            x80T,              # (80,T)
+            x80T.T,            # (T,80)
+            x80T[..., None],   # (80,T,1)
+            x80T.T[..., None], # (T,80,1)
+            mel_1x80xT,                     # (1,80,T)
+            np.transpose(mel_1x80xT, (0,2,1)),         # (1,T,80)
+            mel_1x80xT[..., None],                     # (1,80,T,1)
+            np.transpose(mel_1x80xT, (0,2,1))[..., None],  # (1,T,80,1)
+        ]
 
-        # --- 2D (no batch/channel in HEF) ---
-        if len(fshape) == 2:
-            # (80, T)
-            if fshape == (80, T):
-                return add_batch(x)
-            # (T, 80)
-            if fshape == (T, 80):
-                return add_batch(x.T)
+        for c in candidates:
+            if c.shape == target:
+                out = _np_c(c)
+                if DEBUG_HAILO:
+                    exp = int(np.prod(target) * 4)
+                    print(f"[HailoWhisperEncoder] Prepared frame shape={out.shape}, nbytes={out.nbytes} (exp {exp})")
+                return out
 
-        # --- 3D (one of dims might be batch=1 or channel=1) ---
-        if len(fshape) == 3:
-            # (1, 80, T)  -> exactly our host layout w/ batch in HEF
-            if fshape == (1, 80, T):
-                return add_batch(x)  # will become (1,80,T) with our added batch -> (1,80,T) OK
-            # (1, T, 80)
-            if fshape == (1, T, 80):
-                return add_batch(x.T)
-            # (80, T, 1)
-            if fshape == (80, T, 1):
-                return add_batch(np.expand_dims(x, -1))
-            # (T, 80, 1)
-            if fshape == (T, 80, 1):
-                return add_batch(np.expand_dims(x.T, -1))
-            # (1, 80, T,?) � Some builds report batch inside shape (you saw (1,500,80))
-            # Handle (1, 500, 80) = (batch, T, 80)
-            if fshape[0] == 1 and fshape[1:] == (T, 80):
-                return add_batch(x.T)
-            # Handle (1, 80, 500)
-            if fshape[0] == 1 and fshape[1:] == (80, T):
-                return add_batch(x)
+        # Special-case common HEF shapes we�ve seen:
+        # (1, T, 80) where T matches our T
+        if len(target) == 3 and target[0] == 1 and target[1] == T and target[2] == 80:
+            out = _np_c(np.transpose(mel_1x80xT, (0,2,1)))  # (1,T,80)
+            if DEBUG_HAILO:
+                exp = int(np.prod(target) * 4)
+                print(f"[HailoWhisperEncoder] Prepared frame shape={out.shape}, nbytes={out.nbytes} (exp {exp})")
+            return out
 
-        # --- 4D (batch + H/W + C) variants ---
-        if len(fshape) == 4:
-            # (1, 80, T, 1)
-            if fshape == (1, 80, T, 1):
-                return add_batch(np.expand_dims(x, -1))
-            # (1, T, 80, 1)
-            if fshape == (1, T, 80, 1):
-                return add_batch(np.expand_dims(x.T, -1))
-
-        raise ValueError(f"Mel (80,{T}) cannot be arranged to HEF input {fshape}")
+        raise ValueError(f"Cannot map mel (1,80,{T}) to HEF input {target}")
 
 
     def encode(self, mel_1x80xT: np.ndarray) -> np.ndarray:
-        """
-        Run a single encoder pass.
-        Returns: np.ndarray with shape [1, T_enc, D] (float32).
-        """
-        # Prepare data to match HEF input
-        frame = self._prepare_input_frame(mel_1x80xT)
+        frame = self._prepare_input_frame(mel_1x80xT)  # EXACT vstream shape
+        # Belt & suspenders: verify byte size matches what Hailo expects
+        expected_nbytes = int(np.prod(self.in_info.shape) * 4)  # float32
+        if frame.nbytes != expected_nbytes:
+            raise ValueError(f"Bad input size: got {frame.nbytes} bytes, expected {expected_nbytes} for {self.in_info.shape}")
 
-        # Activate and infer (open/close per call for simplicity)
         with self.network_group.activate(self.network_group_params):
             with hpf.InferVStreams(self.network_group, self.in_params, self.out_params) as pipe:
                 outputs = pipe.infer({self.in_info.name: frame})
 
         enc = outputs[self.out_info.name]
-        # Ensure [1, T_enc, D] for huggingface decoder
         if enc.ndim == 2:
-            enc = np.expand_dims(enc, axis=0)
-        return enc.astype(np.float32, copy=False)
+            enc = np.expand_dims(enc, 0)  # [1, T_enc, D] for HF decoder
+        return _np_c(enc)
+
 
     def close(self):
         try:
