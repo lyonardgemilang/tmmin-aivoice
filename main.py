@@ -24,7 +24,7 @@ program_state = {
 }
 
 ESP = None
-USING_ESP = False
+USING_ESP = True
 
 SEND_TO_WEBSERVER = True
 WEB_SERVER_URL = "http://10.0.0.76:5000/task"
@@ -71,7 +71,7 @@ nlp_label_list_online = nlp_label_list_offline + new_online_only_labels
 
 # Inisialisasi model NLP
 try:
-    nlp_model_path = os.path.join(this_file_dir, "nlp/mdeberta-intent-classification-final")
+    nlp_model_path = os.path.join(this_file_dir, "natural_language_processing/mdeberta-intent-classification-final")
     nlp_tokenizer = AutoTokenizer.from_pretrained(nlp_model_path)
     nlp_model = AutoModelForSequenceClassification.from_pretrained(nlp_model_path)
     nlp_model = nlp_model.eval().to("cpu")
@@ -85,7 +85,7 @@ except Exception as e:
 # --- Inisialisasi Dataset Exact Match (Lapisan Baru) ---
 exact_match_intent_dict = {}
 try:
-    exact_match_dataset_path = os.path.join(this_file_dir, "nlp/final_train_data.json")
+    exact_match_dataset_path = os.path.join(this_file_dir, "natural_language_processing/final_train_data.json")
     with open(exact_match_dataset_path, 'r', encoding='utf-8') as f:
         dataset_data = json.load(f)
     
