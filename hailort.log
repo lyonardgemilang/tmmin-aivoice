@@ -2396,3 +2396,13 @@
 [2025-09-17 14:27:27.445] [6195] [HailoRT] [info] [queue_elements.cpp:46] [~BaseQueueElement] Queue element PushQEl1base-whisper-encoder-5s/input_layer1 has 0 frames in his Queue on destruction
 [2025-09-17 14:27:27.446] [6195] [HailoRT] [info] [core_op.cpp:186] [deactivate] Deactivating took 0.59074 ms
 [2025-09-17 14:27:27.446] [6195] [HailoRT] [info] [core_op.cpp:186] [deactivate] Deactivating took 0.60911 ms
+[2025-09-22 09:18:01.332] [3711] [HailoRT] [info] [vdevice.cpp:523] [create] Creating vdevice with params: device_count: 1, scheduling_algorithm: NONE, multi_process_service: false
+[2025-09-22 09:18:01.363] [3711] [HailoRT] [info] [device.cpp:49] [Device] OS Version: Linux 6.12.25+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.12.25-1+rpt1 (2025-04-30) aarch64
+[2025-09-22 09:18:01.365] [3711] [HailoRT] [info] [control.cpp:108] [control__parse_identify_results] firmware_version is: 4.20.0
+[2025-09-22 09:18:01.365] [3711] [HailoRT] [info] [vdevice.cpp:651] [create] VDevice Infos: 0001:01:00.0
+[2025-09-22 09:18:01.377] [3711] [HailoRT] [info] [internal_buffer_manager.cpp:204] [print_execution_results] Planned internal buffer memory: CMA memory 0, user memory 1576448. memory to edge layer usage factor is 0.34360003
+[2025-09-22 09:18:01.377] [3711] [HailoRT] [info] [internal_buffer_manager.cpp:212] [print_execution_results] Default Internal buffer planner executed successfully
+[2025-09-22 09:18:01.470] [3711] [HailoRT] [info] [device_internal.cpp:57] [configure] Configuring HEF took 103.47078 milliseconds
+[2025-09-22 09:18:01.470] [3711] [HailoRT] [info] [vdevice.cpp:749] [configure] Configuring HEF on VDevice took 104.5454 milliseconds
+[2025-09-22 09:18:01.470] [3711] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: base-whisper-encoder-5s
+[2025-09-22 09:18:01.470] [3711] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: base-whisper-encoder-5s
