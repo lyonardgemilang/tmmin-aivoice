@@ -154,6 +154,8 @@ this_file_dir = os.path.dirname(os.path.abspath(__file__))
 # Preferred input device/channels (auto-detected; used to extract ReSpeaker channel 0)
 PREFERRED_INPUT_DEVICE_INDEX: Optional[int] = None
 PREFERRED_INPUT_CHANNELS: int = 1
+# Effective samplerate chosen for the current input device/channels
+EFFECTIVE_INPUT_SAMPLERATE: Optional[int] = None
 
 # --- Definisi Label untuk Mode Offline dan Online ---
 # Daftar label untuk model OFFLINE (yang sudah dilatih)
@@ -518,6 +520,48 @@ def select_preferred_input_device():
     except Exception:
         print(f"Input device terpilih: index={PREFERRED_INPUT_DEVICE_INDEX}, channels={PREFERRED_INPUT_CHANNELS}")
 
+
+def determine_working_input_config() -> Tuple[int, int]:
+    """Determine a samplerate and channels that are valid for the selected input device.
+
+    Tries the device's default samplerate first, then a set of common rates.
+    If multi-channel is unsupported at that rate, fall back to mono.
+    Returns (samplerate, channels).
+    """
+    global PREFERRED_INPUT_DEVICE_INDEX, PREFERRED_INPUT_CHANNELS
+    try:
+        # Prefer the selected device; fall back to default input device
+        dev_arg = PREFERRED_INPUT_DEVICE_INDEX if PREFERRED_INPUT_DEVICE_INDEX is not None else None
+        dev_info = sd.query_devices(dev_arg, 'input')
+        default_sr_val = int(dev_info.get('default_samplerate', 16000) or 16000)
+    except Exception:
+        dev_arg = None
+        default_sr_val = 16000
+
+    # Try current requested channels first, then fall back to mono
+    channel_candidates = [max(1, PREFERRED_INPUT_CHANNELS)]
+    if 1 not in channel_candidates:
+        channel_candidates.append(1)
+
+    # Candidate samplerates to try
+    sr_candidates: List[int] = []
+    for s in [default_sr_val, 16000, 48000, 44100, 32000, 22050, 8000]:
+        if s not in sr_candidates:
+            sr_candidates.append(int(s))
+
+    # Probe combinations using PortAudio's check function
+    for ch in channel_candidates:
+        for sr in sr_candidates:
+            try:
+                sd.check_input_settings(device=dev_arg, channels=ch, samplerate=sr, dtype='int16')
+                # Found a working combo
+                return int(sr), int(ch)
+            except Exception:
+                continue
+
+    # As a last resort, return a very safe default
+    return 16000, 1
+
 def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sampling_rate=16000):
     chunk_duration = 0.5
     chunk_samples = int(chunk_duration * sampling_rate)
@@ -528,9 +572,21 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sam
     print("Mulai merekam (dinamis)...")
     try:
         # Use preferred device/channels; extract channel 0 on multi-channel devices (e.g., ReSpeaker)
+        # Ensure the provided samplerate/channels are valid; if not, fall back
+        use_sr, use_ch = sampling_rate, max(1, PREFERRED_INPUT_CHANNELS)
+        try:
+            sd.check_input_settings(device=PREFERRED_INPUT_DEVICE_INDEX if PREFERRED_INPUT_DEVICE_INDEX is not None else None,
+                                    channels=use_ch, samplerate=use_sr, dtype='float32')
+        except Exception:
+            # Fallback to a safe config
+            use_sr, use_ch = determine_working_input_config()
+            print(f"Perekaman dinamis: fallback ke samplerate={use_sr}, channels={use_ch}")
+
+        # Ensure chunk size matches the effective samplerate
+        chunk_samples = int(chunk_duration * use_sr)
         with sd.InputStream(
-            samplerate=sampling_rate,
-            channels=max(1, PREFERRED_INPUT_CHANNELS),
+            samplerate=use_sr,
+            channels=use_ch,
             dtype='float32',
             blocksize=chunk_samples,
             device=PREFERRED_INPUT_DEVICE_INDEX,
@@ -544,7 +600,7 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sam
                     chunk, overflowed = stream.read(chunk_samples)
                     if overflowed:
                         print("PERINGATAN: Input audio overflow saat merekam perintah (min_samples loop).", file=sys.stderr)
-                    if PREFERRED_INPUT_CHANNELS > 1 and chunk.ndim == 2 and chunk.shape[1] >= 1:
+                    if use_ch > 1 and chunk.ndim == 2 and chunk.shape[1] >= 1:
                         total_audio.extend(chunk[:, 0].astype(np.float32))
                     else:
                         total_audio.extend(chunk.flatten())
@@ -568,7 +624,7 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sam
                     chunk, overflowed = stream.read(chunk_samples)
                     if overflowed:
                         print("PERINGATAN: Input audio overflow saat merekam perintah (max_samples loop).", file=sys.stderr)
-                    if PREFERRED_INPUT_CHANNELS > 1 and chunk.ndim == 2 and chunk.shape[1] >= 1:
+                    if use_ch > 1 and chunk.ndim == 2 and chunk.shape[1] >= 1:
                         total_audio.extend(chunk[:, 0].astype(np.float32))
                     else:
                         total_audio.extend(chunk.flatten())
@@ -608,10 +664,19 @@ def record_audio(duration=2, sampling_rate=16000, noise_reduce=True, dynamic=Tru
     else:
         print(f"Mulai merekam (durasi tetap: {duration} detik)...")
         try:
-            num_samples = int(duration * sampling_rate)
+            # Validate samplerate for the selected device; fall back if needed
+            try:
+                sd.check_input_settings(device=PREFERRED_INPUT_DEVICE_INDEX if PREFERRED_INPUT_DEVICE_INDEX is not None else None,
+                                        channels=max(1, PREFERRED_INPUT_CHANNELS), samplerate=sampling_rate, dtype='float32')
+                effective_sr = int(sampling_rate)
+            except Exception:
+                effective_sr, _effective_ch = determine_working_input_config()
+                print(f"Perekaman tetap: fallback ke samplerate={effective_sr}")
+
+            num_samples = int(duration * effective_sr)
             recording = sd.rec(
                 num_samples,
-                samplerate=sampling_rate,
+                samplerate=effective_sr,
                 channels=max(1, PREFERRED_INPUT_CHANNELS),
                 dtype='float32',
                 device=PREFERRED_INPUT_DEVICE_INDEX,
@@ -1373,13 +1438,19 @@ def main() -> None:
         print("FATAL: Gagal melakukan inisialisasi sistem. Program berhenti.")
         sys.exit(1)
 
+    # Determine a working samplerate/channels for the selected input device
     try:
-        device_info = sd.query_devices(None, "input")
-        samplerate = int(device_info.get("default_samplerate", 16000))
-        print(f"Menggunakan samplerate: {samplerate} Hz dari perangkat input default.")
+        sr, ch = determine_working_input_config()
+        # Update globals for consistency
+        global EFFECTIVE_INPUT_SAMPLERATE, PREFERRED_INPUT_CHANNELS
+        EFFECTIVE_INPUT_SAMPLERATE = int(sr)
+        PREFERRED_INPUT_CHANNELS = int(ch)
+        print(f"Konfigurasi audio input: samplerate={EFFECTIVE_INPUT_SAMPLERATE} Hz, channels={PREFERRED_INPUT_CHANNELS}.")
+        samplerate = EFFECTIVE_INPUT_SAMPLERATE
     except Exception as exc:
-        print(f"PERINGATAN: Gagal mendapatkan default samplerate dari SoundDevice: {exc}. Menggunakan default 16000 Hz.")
+        print(f"PERINGATAN: Gagal menentukan konfigurasi input yang valid: {exc}. Menggunakan default 16000 Hz, mono.")
         samplerate = 16000
+        PREFERRED_INPUT_CHANNELS = 1
 
     audio_stream = None
     vosk_thread = None
@@ -1397,9 +1468,22 @@ def main() -> None:
             blocksize_callback_samples = int(samplerate * callback_chunk_duration_sec)
 
             try:
+                # Validate the streaming settings before opening
+                try:
+                    sd.check_input_settings(
+                        device=PREFERRED_INPUT_DEVICE_INDEX if PREFERRED_INPUT_DEVICE_INDEX is not None else None,
+                        channels=max(1, PREFERRED_INPUT_CHANNELS),
+                        samplerate=samplerate,
+                        dtype='int16',
+                    )
+                except Exception:
+                    # Re-determine working config on-the-fly (device may change)
+                    samplerate, PREFERRED_INPUT_CHANNELS = determine_working_input_config()
+                    print(f"Stream wake word: fallback ke samplerate={samplerate}, channels={PREFERRED_INPUT_CHANNELS}")
+
                 audio_stream = sd.RawInputStream(
                     samplerate=samplerate,
-                    blocksize=blocksize_callback_samples,
+                    blocksize=int(samplerate * callback_chunk_duration_sec),
                     device=PREFERRED_INPUT_DEVICE_INDEX,
                     dtype="int16",
                     channels=max(1, PREFERRED_INPUT_CHANNELS),
@@ -1496,7 +1580,8 @@ def main() -> None:
 
                     remaining_time = command_mode_timeout - (current_loop_time - command_session_start_time)
                     print(f"\nSilahkan ucapkan perintah (Bahasa: {current_predicted_language}, Sisa waktu: {remaining_time:.0f} detik)...")
-                    command_sampling_rate = 16000
+                    # Use the same effective samplerate for command recording
+                    command_sampling_rate = samplerate
                     recorded_audio_cmd_float32 = record_audio(
                         duration=3,
                         sampling_rate=command_sampling_rate,
