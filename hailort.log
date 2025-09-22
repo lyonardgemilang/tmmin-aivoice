@@ -2406,3 +2406,48 @@
 [2025-09-22 09:18:01.470] [3711] [HailoRT] [info] [vdevice.cpp:749] [configure] Configuring HEF on VDevice took 104.5454 milliseconds
 [2025-09-22 09:18:01.470] [3711] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: base-whisper-encoder-5s
 [2025-09-22 09:18:01.470] [3711] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: base-whisper-encoder-5s
+[2025-09-22 09:27:56.538] [4885] [HailoRT] [info] [vdevice.cpp:523] [create] Creating vdevice with params: device_count: 1, scheduling_algorithm: NONE, multi_process_service: false
+[2025-09-22 09:27:56.551] [4885] [HailoRT] [info] [device.cpp:49] [Device] OS Version: Linux 6.12.25+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.12.25-1+rpt1 (2025-04-30) aarch64
+[2025-09-22 09:27:56.553] [4885] [HailoRT] [info] [control.cpp:108] [control__parse_identify_results] firmware_version is: 4.20.0
+[2025-09-22 09:27:56.553] [4885] [HailoRT] [info] [vdevice.cpp:651] [create] VDevice Infos: 0001:01:00.0
+[2025-09-22 09:27:56.560] [4885] [HailoRT] [info] [internal_buffer_manager.cpp:204] [print_execution_results] Planned internal buffer memory: CMA memory 0, user memory 1576448. memory to edge layer usage factor is 0.34360003
+[2025-09-22 09:27:56.560] [4885] [HailoRT] [info] [internal_buffer_manager.cpp:212] [print_execution_results] Default Internal buffer planner executed successfully
+[2025-09-22 09:27:56.637] [4885] [HailoRT] [info] [device_internal.cpp:57] [configure] Configuring HEF took 83.083497 milliseconds
+[2025-09-22 09:27:56.637] [4885] [HailoRT] [info] [vdevice.cpp:749] [configure] Configuring HEF on VDevice took 83.426836 milliseconds
+[2025-09-22 09:27:56.637] [4885] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: base-whisper-encoder-5s
+[2025-09-22 09:27:56.637] [4885] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: base-whisper-encoder-5s
+[2025-09-22 09:41:02.696] [5859] [HailoRT] [info] [vdevice.cpp:523] [create] Creating vdevice with params: device_count: 1, scheduling_algorithm: NONE, multi_process_service: false
+[2025-09-22 09:41:02.708] [5859] [HailoRT] [info] [device.cpp:49] [Device] OS Version: Linux 6.12.25+rpt-rpi-2712 #1 SMP PREEMPT Debian 1:6.12.25-1+rpt1 (2025-04-30) aarch64
+[2025-09-22 09:41:02.711] [5859] [HailoRT] [info] [control.cpp:108] [control__parse_identify_results] firmware_version is: 4.20.0
+[2025-09-22 09:41:02.711] [5859] [HailoRT] [info] [vdevice.cpp:651] [create] VDevice Infos: 0001:01:00.0
+[2025-09-22 09:41:02.719] [5859] [HailoRT] [info] [internal_buffer_manager.cpp:204] [print_execution_results] Planned internal buffer memory: CMA memory 0, user memory 1576448. memory to edge layer usage factor is 0.34360003
+[2025-09-22 09:41:02.719] [5859] [HailoRT] [info] [internal_buffer_manager.cpp:212] [print_execution_results] Default Internal buffer planner executed successfully
+[2025-09-22 09:41:02.798] [5859] [HailoRT] [info] [device_internal.cpp:57] [configure] Configuring HEF took 86.991761 milliseconds
+[2025-09-22 09:41:02.798] [5859] [HailoRT] [info] [vdevice.cpp:749] [configure] Configuring HEF on VDevice took 87.28206 milliseconds
+[2025-09-22 09:41:02.798] [5859] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: base-whisper-encoder-5s
+[2025-09-22 09:41:02.798] [5859] [HailoRT] [info] [hef.cpp:1929] [get_network_group_and_network_name] No name was given. Addressing all networks of default network_group: base-whisper-encoder-5s
+[2025-09-22 09:41:47.787] [6516] [HailoRT] [info] [core_op.cpp:156] [activate] Activating base-whisper-encoder-5s took 0.328818 milliseconds. Note that the function is asynchronous and thus the network is not fully activated yet.
+[2025-09-22 09:41:47.787] [6516] [HailoRT] [info] [core_op.cpp:156] [activate] Activating base-whisper-encoder-5s took 0.40106 milliseconds. Note that the function is asynchronous and thus the network is not fully activated yet.
+[2025-09-22 09:41:47.788] [6516] [HailoRT] [info] [edge_elements.cpp:52] [create] Created (HwWriteEl1base-whisper-encoder-5s/input_layer1 | hw_frame_size: 40000)
+[2025-09-22 09:41:47.788] [6516] [HailoRT] [info] [queue_elements.cpp:284] [create] Created (PushQEl1base-whisper-encoder-5s/input_layer1 | timeout: 10s)
+[2025-09-22 09:41:47.789] [6516] [HailoRT] [info] [filter_elements.cpp:101] [create] Created (PreInferEl1base-whisper-encoder-5s/input_layer1 | Quantization - src_type: FLOAT32, dst_type UINT8, limvals_min: -1.51241, limvals_max: 1.52432)
+[2025-09-22 09:41:47.789] [6516] [HailoRT] [info] [vstream.cpp:754] [InputVStreamImpl] Creating base-whisper-encoder-5s/input_layer1...
+[2025-09-22 09:41:47.789] [6516] [HailoRT] [info] [vstream_builder.cpp:102] [create_inputs] Input pipeline 'base-whisper-encoder-5s/input_layer1': (PreInferEl1base-whisper-encoder-5s/input_layer1 | Quantization - src_type: FLOAT32, dst_type UINT8, limvals_min: -1.51241, limvals_max: 1.52432) >> (PushQEl1base-whisper-encoder-5s/input_layer1 | timeout: 10s) >> (HwWriteEl1base-whisper-encoder-5s/input_layer1 | hw_frame_size: 40000) >> HW
+[2025-09-22 09:41:47.789] [6516] [HailoRT] [info] [edge_elements.cpp:287] [create] Created (HwReadEl0base-whisper-encoder-5s/normalization13 | hw_frame_size: 128000)
+[2025-09-22 09:41:47.789] [6516] [HailoRT] [info] [queue_elements.cpp:657] [create] Created (PullQEl_hw_read0base-whisper-encoder-5s/normalization13)
+[2025-09-22 09:41:47.789] [6516] [HailoRT] [info] [filter_elements.cpp:375] [create] Created (PostInferEl0base-whisper-encoder-5s/normalization13 | Quantization - src_type: UINT8, dst_type FLOAT32, limvals_min: -23.9557, limvals_max: 14.4638)
+[2025-09-22 09:41:47.789] [6516] [HailoRT] [info] [queue_elements.cpp:800] [create] Created (UserBuffQEl0base-whisper-encoder-5s/normalization13 | timeout: 10s)
+[2025-09-22 09:41:47.789] [6516] [HailoRT] [info] [vstream.cpp:1114] [OutputVStreamImpl] Creating base-whisper-encoder-5s/normalization13...
+[2025-09-22 09:41:47.789] [6516] [HailoRT] [info] [vstream_builder.cpp:220] [create_outputs] Output pipeline 'base-whisper-encoder-5s/normalization13': HW >> (HwReadEl0base-whisper-encoder-5s/normalization13 | hw_frame_size: 128000) >> (PullQEl_hw_read0base-whisper-encoder-5s/normalization13) >> (PostInferEl0base-whisper-encoder-5s/normalization13 | Quantization - src_type: UINT8, dst_type FLOAT32, limvals_min: -23.9557, limvals_max: 14.4638) >> (UserBuffQEl0base-whisper-encoder-5s/normalization13 | timeout: 10s)
+[2025-09-22 09:41:47.892] [6521] [HailoRT] [info] [vdevice_native_stream.cpp:331] [read_impl] Failed read from stream HAILO_STREAM_ABORT(63) (device: 0001:01:00.0)
+[2025-09-22 09:41:47.892] [6521] [HailoRT] [info] [edge_elements.cpp:396] [run_pull] Reading from stream was aborted!
+[2025-09-22 09:41:47.892] [6521] [HailoRT] [info] [queue_elements.cpp:738] [run_in_thread] run_pull of queue element PullQEl_hw_read0base-whisper-encoder-5s/normalization13 was aborted!
+[2025-09-22 09:41:47.892] [6522] [HailoRT] [info] [queue_elements.cpp:855] [run_in_thread] Shutdown event was signaled in dequeue of UserBuffQEl0base-whisper-encoder-5s/normalization13!
+[2025-09-22 09:41:47.892] [6521] [HailoRT] [info] [queue_elements.cpp:68] [operator()] Thread in element PullQEl_hw_read0base-whisper-encoder-5s/normalization13 is not running anymore, exiting..
+[2025-09-22 09:41:47.892] [6516] [HailoRT] [info] [queue_elements.cpp:46] [~BaseQueueElement] Queue element PullQEl_hw_read0base-whisper-encoder-5s/normalization13 has 0 frames in his Queue on destruction
+[2025-09-22 09:41:47.893] [6522] [HailoRT] [info] [queue_elements.cpp:68] [operator()] Thread in element UserBuffQEl0base-whisper-encoder-5s/normalization13 is not running anymore, exiting..
+[2025-09-22 09:41:47.893] [6516] [HailoRT] [info] [queue_elements.cpp:46] [~BaseQueueElement] Queue element UserBuffQEl0base-whisper-encoder-5s/normalization13 has 0 frames in his Queue on destruction
+[2025-09-22 09:41:47.893] [6520] [HailoRT] [info] [queue_elements.cpp:68] [operator()] Thread in element PushQEl1base-whisper-encoder-5s/input_layer1 is not running anymore, exiting..
+[2025-09-22 09:41:47.893] [6516] [HailoRT] [info] [queue_elements.cpp:46] [~BaseQueueElement] Queue element PushQEl1base-whisper-encoder-5s/input_layer1 has 0 frames in his Queue on destruction
+[2025-09-22 09:41:47.894] [6516] [HailoRT] [info] [core_op.cpp:186] [deactivate] Deactivating took 0.598914 ms
+[2025-09-22 09:41:47.894] [6516] [HailoRT] [info] [core_op.cpp:186] [deactivate] Deactivating took 0.616099 ms
