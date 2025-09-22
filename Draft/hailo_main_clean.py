@@ -307,7 +307,7 @@ def check_speakers():
         if p:
             p.terminate()
 
-def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sampling_rate=16000):
+def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sampling_rate=44100):
     chunk_duration = 0.5
     chunk_samples = int(chunk_duration * sampling_rate)
     total_audio = []
@@ -378,7 +378,7 @@ def online_stt_recognize(audio_data_sr, language, result_container):
         print(f"Google STT: Error tak terduga: {e}")
         result_container['text'] = ""
 
-def record_audio(duration=2, sampling_rate=16000, noise_reduce=True, dynamic=True):
+def record_audio(duration=2, sampling_rate=44100, noise_reduce=True, dynamic=True):
     if dynamic:
         audio_data = record_audio_dynamic(duration_min=duration, duration_max=5, silence_duration=1, sampling_rate=sampling_rate)
     else:
@@ -431,7 +431,7 @@ def reduce_noise(audio, noise_sample, sr_rate, prop_decrease=0.8):
         print(f"Error dalam noise reduction: {e}")
         return audio
 
-def save_audio(audio_array, filename, sampling_rate=16000):
+def save_audio(audio_array, filename, sampling_rate=44100):
     try:
         if audio_array.size == 0:
             print(f"Tidak ada data audio untuk disimpan ke {filename}.")
