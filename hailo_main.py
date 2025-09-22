@@ -315,7 +315,7 @@ def check_speakers():
         if p:
             p.terminate()
 
-def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sampling_rate=44100):
+def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sampling_rate=16000):
     chunk_duration = 0.5
     chunk_samples = int(chunk_duration * sampling_rate)
     total_audio = []
@@ -386,7 +386,7 @@ def online_stt_recognize(audio_data_sr, language, result_container):
         print(f"Google STT: Error tak terduga: {e}")
         result_container['text'] = ""
 
-def record_audio(duration=2, sampling_rate=44100, noise_reduce=True, dynamic=True):
+def record_audio(duration=2, sampling_rate=16000, noise_reduce=True, dynamic=True):
     if dynamic:
         audio_data = record_audio_dynamic(duration_min=duration, duration_max=5, silence_duration=1, sampling_rate=sampling_rate)
     else:
@@ -439,7 +439,7 @@ def reduce_noise(audio, noise_sample, sr_rate, prop_decrease=0.8):
         print(f"Error dalam noise reduction: {e}")
         return audio
 
-def save_audio(audio_array, filename, sampling_rate=44100):
+def save_audio(audio_array, filename, sampling_rate=16000):
     try:
         if audio_array.size == 0:
             print(f"Tidak ada data audio untuk disimpan ke {filename}.")
@@ -474,7 +474,7 @@ def _fit_to_hailo_window(feats_np, window_seconds):
     pad = np.zeros((1, 80, target_T - T), dtype=feats_np.dtype)
     return np.concatenate([feats_np, pad], axis=2)
 
-def transcribe_audio(audio_array_float32, sampling_rate=44100, language="Indonesian"):
+def transcribe_audio(audio_array_float32, sampling_rate=16000, language="Indonesian"):
     # Hailo encoder + HF decoder
     if hailo_enc is not None and hf_processor is not None and hf_decoder is not None:
         try:
@@ -851,7 +851,7 @@ def initialize_system():
 
 ONLINE_WAKE_WORD_CHECK_INTERVAL = 2
 ONLINE_WAKE_WORD_RECORD_DURATION = 4 
-SAMPLE_RATE = 44100 
+SAMPLE_RATE = 16000 
 SAMPLE_WIDTH_BYTES = 2 
 
 def run_vosk_wake_word_detector(wake_event, vosk_recognizer, main_loop_flag, samplerate, result_language_container):
@@ -1161,11 +1161,11 @@ if __name__ == "__main__":
 
     try:
         device_info = sd.query_devices(None, "input") 
-        SAMPLERATE = int(device_info.get("default_samplerate", 44100))
+        SAMPLERATE = int(device_info.get("default_samplerate", 16000))
         print(f"Menggunakan samplerate: {SAMPLERATE} Hz dari perangkat input default.")
     except Exception as e:
-        print(f"PERINGATAN: Gagal mendapatkan default samplerate dari SoundDevice: {e}. Menggunakan default 44100 Hz.")
-        SAMPLERATE = 44100
+        print(f"PERINGATAN: Gagal mendapatkan default samplerate dari SoundDevice: {e}. Menggunakan default 16000 Hz.")
+        SAMPLERATE = 16000
 
     audio_stream = None
     vosk_thread = None
@@ -1284,7 +1284,7 @@ if __name__ == "__main__":
                     
                     if not relevant_command_processed_this_session.is_set() and main_loop_active_flag.is_set():
                         print(f"\nSilahkan ucapkan perintah (Bahasa: {current_predicted_language}, Sisa waktu: {remaining_time:.0f} detik)...")
-                        command_sampling_rate = 44100 
+                        command_sampling_rate = 16000 
                         recorded_audio_cmd_float32 = record_audio(
                             duration=3, 
                             sampling_rate=command_sampling_rate,
