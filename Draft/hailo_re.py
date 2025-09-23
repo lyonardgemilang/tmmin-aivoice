@@ -1,9 +1,8 @@
-"""Voice assistant entry point using Hailo Whisper encoder and fallback pipelines."""
+"""Voice assistant entry point using Hailo Whisper encoder (offline only)."""
 
 import json
 import logging
 import os
-import socket
 import sys
 import threading
 import time
@@ -13,20 +12,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pygame
 import pyaudio
-import requests
 import serial
 import sounddevice as sd
-import speech_recognition as sr
 import torch
 import noisereduce as nr
-from dotenv import load_dotenv
-from pywifi import PyWiFi, Profile, const
 from scipy.io import wavfile as wav
 from serial.tools import list_ports
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from vosk import KaldiRecognizer, Model
-
-from faster_whisper import WhisperModel
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -37,10 +30,7 @@ class AssistantConfig:
     use_hailo_encoder: bool = True
     hailo_encoder_hef: str = "base-whisper-encoder-5s_h8l.hef"
     hailo_window_seconds: int = 5
-    use_google_stt: bool = False
     decoder_local_dir: Optional[str] = None
-    send_to_webserver: bool = True
-    web_server_url: str = "http://10.0.0.76:5000/task"
     use_esp: bool = True
 
 
@@ -57,7 +47,6 @@ class SpeechModels:
     hailo_encoder: Optional[Any] = None
     hf_processor: Optional[Any] = None
     hf_decoder: Optional[Any] = None
-    faster_whisper: Optional[Any] = None
 
 
 @dataclass
@@ -136,14 +125,6 @@ MODELS = SpeechModels()
 RUNTIME = AssistantRuntime()
 INTENT_MODELS: Optional[IntentModels] = None
 
-load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    print("PERINGATAN: GEMINI_API_KEY tidak ditemukan di .env file. Fungsi online intent akan gagal.")
-    GEMINI_URL = ""
-else:
-    GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" + GEMINI_API_KEY
-
 try:
     pygame.mixer.init()
 except pygame.error as e:
@@ -162,7 +143,7 @@ EFFECTIVE_INPUT_SAMPLERATE: Optional[int] = None
 # (0-based) when 8 channels are exposed. Allow override via env var.
 EXTRACT_CHANNEL_INDEX: int = int(os.getenv("RESPEAKER_EXTRACT_CHANNEL", "0"))
 
-# --- Definisi Label untuk Mode Offline dan Online ---
+# --- Definisi Label untuk Mode Offline ---
 # Daftar label untuk model OFFLINE (yang sudah dilatih)
 nlp_label_list_offline = [
     "nyalakan lampu merah", "nyalakan lampu hijau", "nyalakan lampu biru",
@@ -172,19 +153,6 @@ nlp_label_list_offline = [
     "nyalakan mode sad", "matikan lampu", "tidak relevan", "nyalakan lampu",
     "gender ke wanita", "gender ke pria", "fitur belum didukung", "turunkan kecerahan", "naikkan kecerahan"
 ]
-
-# Label baru yang hanya akan digunakan dalam mode ONLINE
-new_online_only_labels = [
-    "buka kap mobil",
-    "buka tutup bensin",
-    # "posisi dongkrak",
-    # "cara buka ban serep",
-    # "cara ganti ban",
-    # "info seatbelt pretensioner"
-]
-
-# Daftar label gabungan untuk mode ONLINE (Gemini API)
-nlp_label_list_online = nlp_label_list_offline + new_online_only_labels
 
 
 # Inisialisasi model NLP
@@ -222,16 +190,7 @@ except Exception as e:
     print(f"Gagal memuat dataset exact match: {e}. Fitur ini akan dinonaktifkan.")
 
 
-# Inisialisasi model STT (faster-whisper)
-# try:
-#     stt_model_faster_whisper = WhisperModel("base", device="cpu", compute_type="int8")
-#     print("Model STT (faster-whisper 'base') berhasil dimuat.")
-# except Exception as e:
-#     print(f"Gagal memuat model STT (faster-whisper): {e}. Program mungkin tidak berfungsi dengan benar.")
-#     sys.exit(1)
-
 # Inisialisasi STT (Hailo encoder + HF decoder) atau fallback ke faster-whisper
-
 try:
     if CONFIG.use_hailo_encoder:
         from hailo_whisper import HailoWhisperEncoder
@@ -247,28 +206,15 @@ try:
                 .to("cpu")
             )
         else:
-            MODELS.hf_processor = AutoProcessor.from_pretrained("openai/whisper-base")
-            MODELS.hf_decoder = (
-                WhisperForConditionalGeneration.from_pretrained("openai/whisper-base")
-                .eval()
-                .to("cpu")
-            )
+            print("FATAL: decoder_local_dir tidak diset. Untuk mode offline penuh, siapkan decoder lokal dan set CONFIG.decoder_local_dir.")
+            sys.exit(1)
 
-        MODELS.faster_whisper = None
-        LOGGER.info("STT siap: Hailo encoder (base, 5s) + HF decoder (CPU).")
+        LOGGER.info("STT siap: Hailo encoder (base, 5s) + HF decoder (CPU, lokal).")
     else:
         raise RuntimeError("CONFIG.use_hailo_encoder is False")
 except Exception as e:
-    print(f"Gagal init Hailo encoder pipeline: {e}. Fallback ke faster-whisper.")
-    MODELS.hailo_encoder = None
-    MODELS.hf_processor = None
-    MODELS.hf_decoder = None
-    try:
-        MODELS.faster_whisper = WhisperModel("base", device="cpu", compute_type="int8")
-        LOGGER.info("Model STT (faster-whisper 'base') berhasil dimuat.")
-    except Exception as e2:
-        print(f"Gagal memuat model STT (faster-whisper): {e2}")
-        sys.exit(1)
+    print(f"FATAL: Gagal init Hailo encoder/decoder pipeline: {e}")
+    sys.exit(1)
 
 
 # --- Audio Buffer Management ---
@@ -298,49 +244,6 @@ def callback(indata, frames, time_info, status):
 
 
 # --- Utility Functions ---
-
-def connect_to_wifi(ssid, password):
-    wifi = PyWiFi()
-    iface = None
-    try:
-        ifaces = wifi.interfaces()
-        if not ifaces:
-            print("Tidak ada antarmuka Wi-Fi yang ditemukan.")
-            return False
-        iface = ifaces[0]
-    except Exception as e:
-        print(f"Error saat mengakses antarmuka Wi-Fi: {e}")
-        return False
-    try:
-        iface.scan()
-        print("Scanning Wi-Fi...")
-        time.sleep(3)
-        scan_results = iface.scan_results()
-    except Exception as e:
-        print(f"Error saat scan Wi-Fi: {e}")
-        return False
-    for network in scan_results:
-        if network.ssid == ssid:
-            print(f"SSID ditemukan: {ssid}")
-            profile = Profile()
-            profile.ssid = ssid
-            profile.auth = const.AUTH_ALG_OPEN
-            profile.akm.append(const.AKM_TYPE_WPA2PSK)
-            profile.cipher = const.CIPHER_TYPE_CCMP
-            profile.key = password
-            iface.remove_all_network_profiles()
-            temp_profile = iface.add_network_profile(profile)
-            iface.connect(temp_profile)
-            print(f"Mencoba terhubung ke {ssid}...")
-            for _ in range(10):
-                time.sleep(1)
-                if iface.status() == const.IFACE_CONNECTED:
-                    print("Berhasil terhubung ke Wi-Fi!")
-                    return True
-            print(f"Gagal terhubung ke {ssid} setelah beberapa percobaan.")
-            return False
-    print(f"SSID {ssid} tidak ditemukan.")
-    return False
 
 def find_respeaker_input_device_sd() -> Tuple[Optional[int], int]:
     """Find ReSpeaker input device using sounddevice; return (device_index, channels).
@@ -392,16 +295,7 @@ def find_respeaker_input_device_sd() -> Tuple[Optional[int], int]:
     except Exception as _exc:
         return None, 1
 
-def is_internet_connected(timeout=2):
-    if not CONFIG.use_google_stt:
-        return False
-    try:
-        socket.create_connection(("8.8.8.8", 53), timeout=timeout)
-        return True
-    except OSError:
-        return False
-    except Exception:
-        return False
+# Internet connectivity no longer used (offline mode)
 
 def find_esp32_port():
     ports = list_ports.comports()
@@ -594,7 +488,7 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=0.4, s
     # Use small chunks for better endpointing; VAD prefers 10/20/30ms frames
     chunk_duration = 0.02 if HAVE_VAD else 0.1
     chunk_samples = int(chunk_duration * sampling_rate)
-    total_audio = []
+    chunks: List[np.ndarray] = []
     min_samples = int(duration_min * sampling_rate)
     max_samples = int(duration_max * sampling_rate)
     silence_threshold = 0.01  # fallback for energy-based VAD
@@ -698,46 +592,35 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=0.4, s
                         voiced_last_time = now
                         # Flush pre-roll
                         for f in pre_roll:
-                            total_audio.extend(f)
+                            chunks.append(f)
                         pre_roll.clear()
                     continue
 
                 # Append chunk
-                total_audio.extend(mono)
+                chunks.append(mono)
                 if is_voiced:
                     voiced_last_time = now
 
                 # Stop if we have recorded at least min_samples and observed trailing silence
-                if len(total_audio) >= min_samples:
+                if int(sum(len(c) for c in chunks)) >= min_samples:
                     if (now - voiced_last_time) >= silence_duration:
                         print("Deteksi akhir ucapan (silence), menghentikan perekaman dinamis.")
                         break
 
                 # Hard cap
-                if len(total_audio) >= max_samples:
+                if int(sum(len(c) for c in chunks)) >= max_samples:
                     print("Mencapai durasi maksimum perekaman dinamis, berhenti.")
                     break
         print("Selesai merekam (dinamis).")
-        return np.array(total_audio)
+        if not chunks:
+            return np.array([])
+        return np.concatenate(chunks, axis=0)
     except sd.PortAudioError as e:
         print(f"Error SoundDevice saat merekam (dinamis): {e}")
         return np.array([])
     except Exception as e:
         print(f"Error tak terduga saat merekam (dinamis): {e}")
         return np.array([])
-
-def online_stt_recognize(audio_data_sr, language, result_container):
-    try:
-        recognizer = sr.Recognizer()
-        result_container['text'] = recognizer.recognize_google(audio_data_sr, language=language)
-    except sr.UnknownValueError:
-        result_container['text'] = ""
-    except sr.RequestError as e:
-        print(f"Google STT: Error koneksi/API; {e}")
-        result_container['text'] = ""
-    except Exception as e:
-        print(f"Google STT: Error tak terduga: {e}")
-        result_container['text'] = ""
 
 def record_audio(duration=2, sampling_rate=16000, noise_reduce=True, dynamic=True):
     if dynamic:
@@ -911,77 +794,10 @@ def transcribe_audio(audio_array_float32, sampling_rate=16000, language="Indones
             return {'text': text, 'processing_time': time.time() - start}
         except Exception as e:
             print(f"Error Hailo path: {e}")
-
-    stt_model = MODELS.faster_whisper
-    if stt_model is None or audio_array_float32.size == 0:
-        return {'text': '', 'processing_time': 0}
-    try:
-        import time
-        import numpy as np
-
-        start = time.time()
-        lang_code_map = {"Indonesian": "id", "English": "en", "Japanese": "ja"}
-        fw_lang_code = lang_code_map.get(language, "id")
-        if audio_array_float32.dtype != np.float32:
-            audio_array_float32 = audio_array_float32.astype(np.float32)
-        segments, _info = stt_model.transcribe(
-            audio_array_float32, beam_size=5, language=fw_lang_code, vad_filter=True
-        )
-        text = "".join(segment.text for segment in segments).strip()
-        return {'text': text, 'processing_time': time.time() - start}
-    except Exception as e:
-        print(f"Error faster-whisper: {e}")
-        return {'text': '', 'processing_time': 0}
+    return {'text': '', 'processing_time': 0}
 
 
-def predict_intent(is_online, text):
-    def predict_online(text_input):
-        if not GEMINI_URL or not GEMINI_API_KEY:
-            print("Gemini API URL atau Key tidak dikonfigurasi. Beralih ke model offline.")
-            return predict_offline(text_input)
-        # Gunakan daftar label ONLINE untuk prompt Gemini
-        prompt = f"""Anda adalah sebuah model untuk melakukan intent classification. Berikut adalah list intent yang mendukung: {nlp_label_list_online} Tolong respons dengan absolut intent yang sesuai dengan kalimat yang diberikan saja, jangan tambahkan kata-kata lain. Classification hanya boleh 1 intent saja. Jika lebih dari satu maksud terdeteksi atau tidak ada yang cocok, kembalikan "tidak relevan". Pikirkan matang-matang maksud dari teks yang diberikan, terkadang terdapat maksud tersirat yang harus dipahami. Jangan terpaku pada teks yang diberikan saja. Teks yang diberikan adalah: "{text_input}". Untuk saat ini program hanya mendukung action untuk ambient light, ganti suara, buka kap mobil, buka tutup bensin, posisi dongkrak, cara buka ban serep, cara ganti ban, dan info seatbelt pretensioner. fitur fitur lain yang berhubungan dengan mobil tapi belum didukung, tolong klasifikasikan sebagai "fitur belum didukung". Intent yang paling sesuai adalah:"""
-        data = {"contents" : [{"parts" : [{"text" : prompt}]}]}
-        try:
-            response = requests.post(GEMINI_URL, json=data, timeout=8)
-            response.raise_for_status() 
-            response_json = response.json()
-            if "candidates" in response_json and \
-               len(response_json["candidates"]) > 0 and \
-               "content" in response_json["candidates"][0] and \
-               "parts" in response_json["candidates"][0]["content"] and \
-               len(response_json["candidates"][0]["content"]["parts"]) > 0 and \
-               "text" in response_json["candidates"][0]["content"]["parts"][0]:
-                predicted_intent = response_json["candidates"][0]["content"]["parts"][0]["text"].strip()
-                # Cek apakah hasil prediksi ada di dalam daftar label online
-                if predicted_intent in nlp_label_list_online:
-                    return predicted_intent
-                else:
-                    for label in nlp_label_list_online:
-                        if label in predicted_intent: 
-                            return label
-                    return "tidak relevan" 
-            else:
-                return "tidak relevan"
-        except requests.exceptions.Timeout:
-            print("Gemini API: Timeout.")
-            return "tidak relevan"
-        except requests.exceptions.HTTPError as e:
-            print(f"Gemini API: HTTP Error: {e}")
-            return "tidak relevan"
-        except requests.exceptions.RequestException as e:
-            print(f"Gemini API: Request Exception: {e}")
-            return "tidak relevan"
-        except json.JSONDecodeError:
-            print("Gemini API: Gagal parse JSON response.")
-            return "tidak relevan"
-        except KeyError as e:
-            print(f"Gemini API: KeyError saat parsing response - {e}.")
-            return "tidak relevan"
-        except Exception as e:
-            print(f"Gemini API: Terjadi error tak terduga: {e}")
-            return "tidak relevan"
-
+def predict_intent(text):
     def predict_offline(text_input):
         if INTENT_MODELS is None:
             print("Model NLP belum dimuat. Kembali ke intent 'tidak relevan'.")
@@ -1005,28 +821,7 @@ def predict_intent(is_online, text):
         except Exception as e:
             print(f"Error saat prediksi intent offline: {e}")
             return "tidak relevan"
-            
-    if is_online:
-        return predict_online(text)
-    else:
-        return predict_offline(text)
-
-def send_to_webserver(command: str) -> bool:
-    if not CONFIG.send_to_webserver:
-        LOGGER.info("Pengiriman ke web server dinonaktifkan.")
-        return True
-    try:
-        params = {'label': command}
-        response = requests.get(CONFIG.web_server_url, params=params)
-        response.raise_for_status()
-        LOGGER.info("Berhasil mengirim ke web server: %s", command)
-        return True
-    except requests.exceptions.Timeout:
-        print("Timeout saat mengirim ke web server.")
-        return False
-    except requests.exceptions.RequestException as exc:
-        print(f"Gagal mengirim ke web server: {exc}")
-        return False
+    return predict_offline(text)
 
 def send_to_esp(command: str) -> bool:
     """Send command to ESP device if configured."""
@@ -1130,11 +925,7 @@ def intent_feedback(intent, predicted_language="Indonesian", main_loop_flag=None
         suffix = "_pria" if STATE.gender == "pria" else ""
         audio_file_to_play = os.path.join(lang_path, f"fitur_belum_didukung{suffix}.mp3")
         STATE.last_command = intent
-    elif intent in new_online_only_labels:
-        print(f"Fitur terdeteksi tapi belum ada feedback audio untuk intent '{intent}'.")
-        send_to_webserver(intent)
-        STATE.last_command = intent
-        pass
+    
     elif "wake" in intent: 
         audio_file_to_play = os.path.join(feedback_audio_base_path, "ping_berbicara.mp3")
         pygame.mixer.music.load(audio_file_to_play)
@@ -1245,10 +1036,7 @@ def initialize_system(main_loop_flag=None):
     print("Sistem siap.")
     return True
 
-ONLINE_WAKE_WORD_CHECK_INTERVAL = 2
-ONLINE_WAKE_WORD_RECORD_DURATION = 4
 SAMPLE_RATE = 16000
-SAMPLE_WIDTH_BYTES = 2
 
 def run_vosk_wake_word_detector(wake_event, vosk_recognizer, main_loop_flag, samplerate, result_language_container):
     print("Vosk wake word detector thread dimulai.")
@@ -1293,90 +1081,6 @@ def run_vosk_wake_word_detector(wake_event, vosk_recognizer, main_loop_flag, sam
         print(f"Error pada Vosk wake word detector: {exc}")
 
 
-def run_online_wake_word_check(wake_event, samplerate, result_language_container, main_loop_flag):
-    if wake_event.is_set() or not main_loop_flag.is_set():
-        return
-
-    print("Memulai pengecekan wake word online (1x STT id-ID)...")
-    bytes_to_collect_requested = int(ONLINE_WAKE_WORD_RECORD_DURATION * samplerate * SAMPLE_WIDTH_BYTES)
-
-    ring_buffer = RUNTIME.ring_buffer
-    total_written = ring_buffer.snapshot_total_written()
-    if total_written == 0:
-        print("Online check: Tidak ada data audio di buffer untuk dicek (0 bytes available).")
-        return
-
-    start_pos = max(0, total_written - bytes_to_collect_requested)
-    collected_bytes, _ = ring_buffer.read_available_since(start_pos, wait_timeout=0.0)
-    if not collected_bytes:
-        print("Online check: Tidak ada data audio diperoleh dari buffer.")
-        return
-
-    if len(collected_bytes) > bytes_to_collect_requested:
-        collected_bytes = collected_bytes[-bytes_to_collect_requested:]
-
-    if wake_event.is_set() or not main_loop_flag.is_set():
-        print("Online check: Pengecekan dibatalkan setelah mengumpulkan data.")
-        return
-
-    audio_int16_np = np.frombuffer(collected_bytes, dtype=np.int16)
-    audio_float32_np = audio_int16_np.astype(np.float32) / 32768.0
-
-    print(
-        f"Online check: Audio terkumpul {len(collected_bytes)} bytes ({len(collected_bytes)/(samplerate*SAMPLE_WIDTH_BYTES):.2f}s). Memanggil is_audio_present..."
-    )
-    if not is_audio_present(audio_float32_np, threshold=0.003):
-        print("Online check: Audio tidak signifikan terdeteksi (setelah is_audio_present).")
-        return
-
-    try:
-        audio_data_sr = sr.AudioData(
-            collected_bytes, sample_rate=samplerate, sample_width=SAMPLE_WIDTH_BYTES
-        )
-        stt_result_container: Dict[str, str] = {}
-        stt_thread = threading.Thread(
-            target=online_stt_recognize,
-            args=(audio_data_sr, "id-ID", stt_result_container),
-            daemon=True,
-        )
-        stt_thread.start()
-        stt_thread.join(timeout=5.0)
-
-        if not main_loop_flag.is_set() or wake_event.is_set():
-            return
-
-        if stt_thread.is_alive():
-            print("Online STT (wake word) timeout.")
-            return
-
-        text_transcribed = stt_result_container.get('text', "").lower().strip()
-        if text_transcribed:
-            print(f"Online check STT result: '{text_transcribed}'.")
-        else:
-            print("Online check: STT tidak menghasilkan teks.")
-            return
-
-        if wake_event.is_set() or not main_loop_flag.is_set():
-            return
-
-        potential_detected_language = None
-        if "oke toyota" in text_transcribed or ("oke" in text_transcribed and "toyota" in text_transcribed) or ("okay toyota" in text_transcribed):
-            potential_detected_language = "Indonesian"
-        elif "hello toyota" in text_transcribed or ("hello" in text_transcribed and "toyota" in text_transcribed):
-            potential_detected_language = "English"
-        elif "hai toyota" in text_transcribed or ("hai" in text_transcribed and "toyota" in text_transcribed) or ("moshi moshi" in text_transcribed):
-            potential_detected_language = "Japanese"
-
-        if potential_detected_language:
-            print(f"Online STT mendeteksi wake word! Bahasa: {potential_detected_language}")
-            result_language_container['language'] = potential_detected_language
-            wake_event.set()
-        else:
-            print("Online STT: Tidak mendeteksi wake word yang valid.")
-    except Exception as exc:
-        print(f"Online STT check error: {exc}")
-
-
 def process_command_audio_in_thread(audio_float32_data, language, sampling_rate, relevant_command_event, main_loop_flag_ref):
     thread_id = threading.get_ident()
 
@@ -1387,65 +1091,14 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
         print(f"Thread ID {thread_id}: Relevant command already processed by another thread. Exiting early.")
         return
 
-    internet_conn = is_internet_connected()
     text_transcribed = ""
     stt_processing_time = 0
 
-    # --- STT Phase ---
-    if CONFIG.use_google_stt and internet_conn:
-        try:
-            stt_online_start_time = time.time()
-            audio_int16_cmd = (audio_float32_data * 32767).astype(np.int16)
-            audio_data_sr_cmd = sr.AudioData(
-                audio_int16_cmd.tobytes(),
-                sample_rate=sampling_rate,
-                sample_width=SAMPLE_WIDTH_BYTES 
-            )
-            lang_code_google_cmd = {"Indonesian": "id-ID", "English": "en-US", "Japanese": "ja-JP"}.get(language, "id-ID")
-            result_container_cmd = {}
-            stt_thread_cmd = threading.Thread(
-                target=online_stt_recognize,
-                args=(audio_data_sr_cmd, lang_code_google_cmd, result_container_cmd)
-            )
-            stt_thread_cmd.daemon = True
-            stt_thread_cmd.start()
-            
-            join_timeout = 5.0
-            wait_interval = 0.1
-            elapsed_wait = 0
-            while stt_thread_cmd.is_alive() and elapsed_wait < join_timeout:
-                if not main_loop_flag_ref.is_set() or relevant_command_event.is_set():
-                    print(f"Thread ID {thread_id}: STT online (Google) interrupted by shutdown or relevant command event.")
-                    return 
-                time.sleep(wait_interval)
-                elapsed_wait += wait_interval
-            
-            if stt_thread_cmd.is_alive():
-                print(f"Thread ID {thread_id}: Timeout STT online (Google) untuk perintah.")
-                raise TimeoutError("Timeout STT online (perintah)")
-            
-            if not main_loop_flag_ref.is_set() or relevant_command_event.is_set(): return
-
-            text_transcribed = result_container_cmd.get('text', "")
-            stt_processing_time = time.time() - stt_online_start_time
-            if not text_transcribed:
-                print(f"Thread ID {thread_id}: STT Online (Google) tidak menghasilkan teks.")
-                raise ValueError("STT Online (Google) gagal menghasilkan teks")
-
-        except Exception as e_stt_online_cmd:
-            if not main_loop_flag_ref.is_set() or relevant_command_event.is_set(): return
-            print(f"Thread ID {thread_id}: Gagal STT online (perintah): {e_stt_online_cmd}. Menggunakan STT offline (faster-whisper)...")
-            
-            if not main_loop_flag_ref.is_set() or relevant_command_event.is_set(): return
-            offline_result_cmd = transcribe_audio(audio_float32_data, sampling_rate=sampling_rate, language=language)
-            text_transcribed = offline_result_cmd["text"]
-            stt_processing_time = offline_result_cmd["processing_time"]
-    else: 
-        if not main_loop_flag_ref.is_set() or relevant_command_event.is_set(): return
-        print(f"Thread ID {thread_id}: Tidak ada koneksi internet. Menggunakan STT offline (faster-whisper) untuk perintah...")
-        offline_result_cmd = transcribe_audio(audio_float32_data, sampling_rate=sampling_rate, language=language)
-        text_transcribed = offline_result_cmd["text"]
-        stt_processing_time = offline_result_cmd["processing_time"]
+    # --- STT Phase (offline, Hailo encoder + HF decoder) ---
+    if not main_loop_flag_ref.is_set() or relevant_command_event.is_set(): return
+    offline_result_cmd = transcribe_audio(audio_float32_data, sampling_rate=sampling_rate, language=language)
+    text_transcribed = offline_result_cmd["text"]
+    stt_processing_time = offline_result_cmd["processing_time"]
 
     if not main_loop_flag_ref.is_set() or relevant_command_event.is_set():
         print(f"Thread ID {thread_id}: Exiting after STT phase due to shutdown or relevant command event.")
@@ -1476,7 +1129,7 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
     else:
         # 2. Jika tidak ada, baru panggil model NLP (online/offline)
         print(f"Thread ID {thread_id}: Tidak ada exact match. Memanggil model NLP...")
-        predicted_intent = predict_intent(internet_conn, text_transcribed)
+        predicted_intent = predict_intent(text_transcribed)
     
     print(f"Thread ID {thread_id}: Prediksi intent final: '{predicted_intent}'")
 
@@ -1535,7 +1188,7 @@ def main() -> None:
 
     audio_stream = None
     vosk_thread = None
-    online_check_thread = None
+    online_check_thread = None  # removed (offline mode)
     active_command_threads: List[threading.Thread] = []
 
     try:
@@ -1598,19 +1251,7 @@ def main() -> None:
             )
             vosk_thread.start()
 
-            last_online_check_time = time.time()
             while not wake_word_detected_event.is_set() and main_loop_active_flag.is_set():
-                current_time = time.time()
-                internet_available = is_internet_connected(timeout=0.5)
-                if internet_available and (current_time - last_online_check_time > ONLINE_WAKE_WORD_CHECK_INTERVAL):
-                    if online_check_thread is None or not online_check_thread.is_alive():
-                        last_online_check_time = current_time
-                        online_check_thread = threading.Thread(
-                            target=run_online_wake_word_check,
-                            args=(wake_word_detected_event, samplerate, detected_language_container, main_loop_active_flag),
-                            daemon=True,
-                        )
-                        online_check_thread.start()
                 time.sleep(0.05)
 
             if audio_stream and audio_stream.active:
@@ -1629,11 +1270,6 @@ def main() -> None:
                 if vosk_thread.is_alive():
                     print("PERINGATAN: Vosk thread tidak berhenti tepat waktu setelah stop stream.")
 
-            if online_check_thread and online_check_thread.is_alive():
-                print("Menunggu online check thread selesai...")
-                online_check_thread.join(timeout=ONLINE_WAKE_WORD_RECORD_DURATION + 7.0)
-                if online_check_thread.is_alive():
-                    print("PERINGATAN: Online check thread tidak berhenti tepat waktu.")
             online_check_thread = None
 
             if detected_language_container.get('language') and main_loop_active_flag.is_set():
@@ -1735,11 +1371,7 @@ def main() -> None:
             vosk_thread.join(timeout=2.0)
             if vosk_thread.is_alive():
                 print("PERINGATAN: Vosk thread tidak berhenti tepat waktu saat shutdown.")
-        if online_check_thread and online_check_thread.is_alive():
-            print("Menunggu online check thread (final)...")
-            online_check_thread.join(timeout=5.0)
-            if online_check_thread.is_alive():
-                print("PERINGATAN: Online check thread tidak berhenti tepat waktu saat shutdown.")
+        # no online_check_thread in offline mode
 
         final_active_command_threads = [thread for thread in active_command_threads if thread.is_alive()]
         if final_active_command_threads:
