@@ -1270,8 +1270,6 @@ def main() -> None:
                 if vosk_thread.is_alive():
                     print("PERINGATAN: Vosk thread tidak berhenti tepat waktu setelah stop stream.")
 
-            online_check_thread = None
-
             if detected_language_container.get('language') and main_loop_active_flag.is_set():
                 STATE.predicted_language_from_wake_word = detected_language_container['language']
                 print(f"Wake word terdeteksi! Bahasa yang digunakan: {STATE.predicted_language_from_wake_word}")
@@ -1405,4 +1403,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
