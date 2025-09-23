@@ -32,6 +32,13 @@ class AssistantConfig:
     hailo_window_seconds: int = 5
     decoder_local_dir: Optional[str] = None
     use_esp: bool = True
+    # Optional Hailo decoder (avoid HF decoder weights)
+    use_hailo_decoder: bool = False
+    hailo_decoder_hef: Optional[str] = "base-whisper-decoder-fixed-sequence-matmul-split_h8l.hef"
+    hailo_decoder_token_in: Optional[str] = None
+    hailo_decoder_encoder_in: Optional[str] = None
+    hailo_decoder_logits_out: Optional[str] = None
+    max_new_tokens: int = 48
 
 
 @dataclass
@@ -47,6 +54,7 @@ class SpeechModels:
     hailo_encoder: Optional[Any] = None
     hf_processor: Optional[Any] = None
     hf_decoder: Optional[Any] = None
+    hailo_decoder: Optional[Any] = None
 
 
 @dataclass
@@ -190,7 +198,7 @@ except Exception as e:
     print(f"Gagal memuat dataset exact match: {e}. Fitur ini akan dinonaktifkan.")
 
 
-# Inisialisasi STT (Hailo encoder + HF decoder) atau fallback ke faster-whisper
+# Inisialisasi STT (Hailo encoder + Hailo decoder HEF optional, else HF decoder CPU)
 try:
     if CONFIG.use_hailo_encoder:
         from hailo_whisper import HailoWhisperEncoder
@@ -200,16 +208,137 @@ try:
 
         if CONFIG.decoder_local_dir:
             MODELS.hf_processor = AutoProcessor.from_pretrained(CONFIG.decoder_local_dir)
-            MODELS.hf_decoder = (
-                WhisperForConditionalGeneration.from_pretrained(CONFIG.decoder_local_dir)
-                .eval()
-                .to("cpu")
-            )
         else:
             print("FATAL: decoder_local_dir tidak diset. Untuk mode offline penuh, siapkan decoder lokal dan set CONFIG.decoder_local_dir.")
             sys.exit(1)
 
-        LOGGER.info("STT siap: Hailo encoder (base, 5s) + HF decoder (CPU, lokal).")
+        # Optional Hailo decoder HEF
+        MODELS.hailo_decoder = None
+        if CONFIG.use_hailo_decoder and CONFIG.hailo_decoder_hef:
+            try:
+                import hailo_platform as hpf
+
+                class HailoWhisperDecoder:
+                    def __init__(self, hef_path: str,
+                                 token_in: Optional[str] = None,
+                                 encoder_in: Optional[str] = None,
+                                 logits_out: Optional[str] = None,
+                                 scheduler: str = "NONE",
+                                 interface: Optional["hpf.HailoStreamInterface"] = None):
+                        self.hef = hpf.HEF(hef_path)
+                        vdev_params = hpf.VDevice.create_params()
+                        sched_map = {
+                            "NONE": hpf.HailoSchedulingAlgorithm.NONE,
+                            "ROUND_ROBIN": hpf.HailoSchedulingAlgorithm.ROUND_ROBIN,
+                        }
+                        vdev_params.scheduling_algorithm = sched_map.get(str(scheduler).upper(), hpf.HailoSchedulingAlgorithm.NONE)
+                        self.device = hpf.VDevice(params=vdev_params)
+                        if interface is None:
+                            interface = hpf.HailoStreamInterface.PCIe
+                        cfg_params = hpf.ConfigureParams.create_from_hef(self.hef, interface=interface)
+                        self.network_group = self.device.configure(self.hef, cfg_params)[0]
+                        self.network_group_params = self.network_group.create_params()
+
+                        ins = self.hef.get_input_vstream_infos()
+                        outs = self.hef.get_output_vstream_infos()
+
+                        def pick_encoder_in():
+                            cand = None
+                            best = -1
+                            for i in ins:
+                                shp = tuple(i.shape)
+                                score = (len(shp) == 3) * (shp[1] * shp[2])
+                                if score > best:
+                                    best, cand = score, i
+                            return cand
+                        def pick_token_in():
+                            cand = None
+                            best = 1e9
+                            for i in ins:
+                                elems = 1
+                                for d in i.shape:
+                                    elems *= int(d)
+                                if elems < best:
+                                    best, cand = elems, i
+                            return cand
+                        def pick_logits_out():
+                            cand = None
+                            best = -1
+                            for o in outs:
+                                shp = tuple(o.shape)
+                                last = shp[-1] if len(shp)>0 else 0
+                                score = last
+                                if score > best:
+                                    best, cand = score, o
+                            return cand
+
+                        self.in_token = next((i for i in ins if i.name == token_in), None) if token_in else None
+                        self.in_encoder = next((i for i in ins if i.name == encoder_in), None) if encoder_in else None
+                        self.out_logits = next((o for o in outs if o.name == logits_out), None) if logits_out else None
+                        if self.in_encoder is None:
+                            self.in_encoder = pick_encoder_in()
+                        if self.in_token is None:
+                            self.in_token = pick_token_in()
+                        if self.out_logits is None:
+                            self.out_logits = pick_logits_out()
+
+                        if not (self.in_encoder and self.in_token and self.out_logits):
+                            print("Hailo decoder HEF stream mapping failed. Available:")
+                            print("Inputs:")
+                            for i in ins:
+                                print(f"  {i.name} shape={i.shape} type={i.format.type}")
+                            print("Outputs:")
+                            for o in outs:
+                                print(f"  {o.name} shape={o.shape} type={o.format.type}")
+                            raise RuntimeError("Cannot auto-map decoder HEF streams; set names in CONFIG.")
+
+                        self.in_params = hpf.InputVStreamParams.make_from_network_group(
+                            self.network_group, quantized=False, format_type=hpf.FormatType.AUTO
+                        )
+                        self.out_params = hpf.OutputVStreamParams.make_from_network_group(
+                            self.network_group, quantized=False, format_type=hpf.FormatType.AUTO
+                        )
+
+                    def close(self):
+                        try:
+                            self.device.release()
+                        except Exception:
+                            pass
+
+                    def step(self, last_token_id: int, enc_states: np.ndarray) -> np.ndarray:
+                        tok = np.array([[last_token_id]], dtype=np.int32)
+                        enc = enc_states.astype(np.float32, copy=False)
+                        with self.network_group.activate(self.network_group_params):
+                            with hpf.InferVStreams(self.network_group, self.in_params, self.out_params) as pipe:
+                                outputs = pipe.infer({
+                                    self.in_token.name: tok,
+                                    self.in_encoder.name: enc,
+                                })
+                        logits = outputs[self.out_logits.name]
+                        return logits
+
+                MODELS.hailo_decoder = HailoWhisperDecoder(
+                    CONFIG.hailo_decoder_hef,
+                    token_in=CONFIG.hailo_decoder_token_in,
+                    encoder_in=CONFIG.hailo_decoder_encoder_in,
+                    logits_out=CONFIG.hailo_decoder_logits_out,
+                )
+                LOGGER.info("Hailo decoder HEF loaded: %s", CONFIG.hailo_decoder_hef)
+            except Exception as dec_e:
+                print(f"PERINGATAN: Gagal memuat Hailo decoder HEF: {dec_e}. Menggunakan HF decoder di CPU.")
+                MODELS.hailo_decoder = None
+
+        # If Hailo decoder not used/failed, use HF decoder (CPU)
+        if MODELS.hailo_decoder is None:
+            if CONFIG.decoder_local_dir:
+                MODELS.hf_decoder = (
+                    WhisperForConditionalGeneration.from_pretrained(CONFIG.decoder_local_dir)
+                    .eval()
+                    .to("cpu")
+                )
+            LOGGER.info("STT siap: Hailo encoder + HF decoder (CPU, lokal).")
+        else:
+            LOGGER.info("STT siap: Hailo encoder + Hailo decoder (HEF).")
     else:
         raise RuntimeError("CONFIG.use_hailo_encoder is False")
 except Exception as e:
@@ -724,77 +853,108 @@ def _fit_to_hailo_window(feats_np, window_seconds):
     return np.concatenate([feats_np, pad], axis=2)
 
 def transcribe_audio(audio_array_float32, sampling_rate=16000, language="Indonesian"):
-    """Transcribe audio either via Hailo encoder or the faster-whisper fallback."""
-    if (
-        MODELS.hailo_encoder is not None
-        and MODELS.hf_processor is not None
-        and MODELS.hf_decoder is not None
-    ):
-        try:
-            import time
-            import numpy as np
-            import torch
-            import transformers
-            from packaging import version
-            from transformers.modeling_outputs import BaseModelOutput
+    """Transcribe audio with Hailo encoder and either Hailo decoder HEF or HF decoder (CPU)."""
+    if MODELS.hailo_encoder is None or MODELS.hf_processor is None:
+        return {'text': '', 'processing_time': 0}
+    try:
+        import time
+        import numpy as np
+        import torch
+        import transformers
+        from packaging import version
+        from transformers.modeling_outputs import BaseModelOutput
 
-            if audio_array_float32.size == 0:
-                return {'text': '', 'processing_time': 0}
+        if audio_array_float32.size == 0:
+            return {'text': '', 'processing_time': 0}
 
-            start = time.time()
-            processor = MODELS.hf_processor
-            decoder = MODELS.hf_decoder
-            inputs = processor(audio_array_float32, sampling_rate=sampling_rate, return_tensors="np")
-            feats = inputs["input_features"].astype(np.float32)
+        start = time.time()
+        processor = MODELS.hf_processor
+        inputs = processor(audio_array_float32, sampling_rate=sampling_rate, return_tensors="np")
+        feats = inputs["input_features"].astype(np.float32)
 
-            if feats.size == 0 or feats.shape[-1] == 0:
-                feats = np.zeros(
-                    (1, 80, int(3000 * CONFIG.hailo_window_seconds / 30)),
-                    dtype=np.float32,
-                )
-            feats = _fit_to_hailo_window(feats, CONFIG.hailo_window_seconds)
-            feats = np.ascontiguousarray(feats, dtype=np.float32)
-
-            enc_np = MODELS.hailo_encoder.encode(feats)
-            enc_t = torch.from_numpy(enc_np).to("cpu")
-            enc_out = BaseModelOutput(last_hidden_state=enc_t)
-
-            lang_map = {"Indonesian": "indonesian", "English": "english", "Japanese": "japanese"}
-            lang_name = lang_map.get(language, "indonesian")
-            gen_kwargs = dict(
-                max_new_tokens=48,
-                num_beams=1,
-                no_repeat_ngram_size=3,
-                repetition_penalty=1.15,
-                length_penalty=1.0,
-                early_stopping=True,
-                do_sample=False,
+        if feats.size == 0 or feats.shape[-1] == 0:
+            feats = np.zeros(
+                (1, 80, int(3000 * CONFIG.hailo_window_seconds / 30)),
+                dtype=np.float32,
             )
+        feats = _fit_to_hailo_window(feats, CONFIG.hailo_window_seconds)
+        feats = np.ascontiguousarray(feats, dtype=np.float32)
 
-            if version.parse(transformers.__version__) >= version.parse("4.38.0"):
-                gen_kwargs.update({"task": "transcribe", "language": lang_name})
-            else:
-                gen_kwargs.update(
-                    {
-                        "forced_decoder_ids": processor.get_decoder_prompt_ids(
-                            language=lang_name, task="transcribe"
-                        )
-                    }
-                )
+        enc_np = MODELS.hailo_encoder.encode(feats)
 
-            decoder.generation_config.eos_token_id = decoder.config.eos_token_id
-            decoder.generation_config.pad_token_id = decoder.config.eos_token_id
-            decoder.generation_config.do_sample = False
-            decoder.generation_config.temperature = 0.0
+        lang_map = {"Indonesian": "indonesian", "English": "english", "Japanese": "japanese"}
+        lang_name = lang_map.get(language, "indonesian")
 
-            with torch.no_grad():
-                gen_ids = decoder.generate(encoder_outputs=enc_out, **gen_kwargs)
+        # If Hailo decoder is available, run greedy decode on-device
+        if MODELS.hailo_decoder is not None:
+            try:
+                # Get prompt ids (language + task) using the tokenizer
+                if version.parse(transformers.__version__) >= version.parse("4.38.0"):
+                    forced_ids = processor.get_decoder_prompt_ids(language=lang_name, task="transcribe")
+                else:
+                    forced_ids = processor.get_decoder_prompt_ids(language=lang_name, task="transcribe")
+                start_ids = [i[1] if isinstance(i, (list, tuple)) else int(i) for i in forced_ids]
 
-            text = processor.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
-            return {'text': text, 'processing_time': time.time() - start}
-        except Exception as e:
-            print(f"Error Hailo path: {e}")
-    return {'text': '', 'processing_time': 0}
+                # Greedy loop using Hailo decoder HEF
+                tokens: List[int] = list(start_ids)
+                eos_id = getattr(getattr(processor, "tokenizer", None), "eos_token_id", None)
+                last_id = tokens[-1]
+                for _ in range(CONFIG.max_new_tokens):
+                    logits = MODELS.hailo_decoder.step(last_id, enc_np)
+                    # Pick last dimension argmax
+                    if logits.ndim > 1:
+                        next_id = int(np.argmax(logits[0]))
+                    else:
+                        next_id = int(np.argmax(logits))
+                    tokens.append(next_id)
+                    last_id = next_id
+                    if eos_id is not None and next_id == eos_id:
+                        break
+
+                # Decode tokens to text via tokenizer
+                if hasattr(processor, "tokenizer"):
+                    text = processor.tokenizer.decode(tokens, skip_special_tokens=True).strip()
+                else:
+                    text = ""
+                return {'text': text, 'processing_time': time.time() - start}
+            except Exception as dec_e:
+                print(f"PERINGATAN: Gagal decode dengan Hailo decoder HEF: {dec_e}. Memakai HF decoder (CPU) bila tersedia.")
+
+        # Fallback to HF decoder on CPU
+        if MODELS.hf_decoder is None:
+            return {'text': '', 'processing_time': 0}
+
+        enc_t = torch.from_numpy(enc_np).to("cpu")
+        enc_out = BaseModelOutput(last_hidden_state=enc_t)
+
+        gen_kwargs = dict(
+            max_new_tokens=CONFIG.max_new_tokens,
+            num_beams=1,
+            no_repeat_ngram_size=3,
+            repetition_penalty=1.15,
+            length_penalty=1.0,
+            early_stopping=True,
+            do_sample=False,
+        )
+        if version.parse(transformers.__version__) >= version.parse("4.38.0"):
+            gen_kwargs.update({"task": "transcribe", "language": lang_name})
+        else:
+            gen_kwargs.update({
+                "forced_decoder_ids": processor.get_decoder_prompt_ids(language=lang_name, task="transcribe")
+            })
+        decoder = MODELS.hf_decoder
+        decoder.generation_config.eos_token_id = decoder.config.eos_token_id
+        decoder.generation_config.pad_token_id = decoder.config.eos_token_id
+        decoder.generation_config.do_sample = False
+        decoder.generation_config.temperature = 0.0
+
+        with torch.no_grad():
+            gen_ids = decoder.generate(encoder_outputs=enc_out, **gen_kwargs)
+        text = processor.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
+        return {'text': text, 'processing_time': time.time() - start}
+    except Exception as e:
+        print(f"Error transcribe_audio: {e}")
+        return {'text': '', 'processing_time': 0}
 
 
 def predict_intent(text):
