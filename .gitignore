@@ -17,3 +17,5 @@ wav2vec_try.py
 nlp
 .venv
 main.py
+hailort.log
+pyhailort.log
