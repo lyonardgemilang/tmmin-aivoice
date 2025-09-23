@@ -157,6 +157,11 @@ PREFERRED_INPUT_CHANNELS: int = 1
 # Effective samplerate chosen for the current input device/channels
 EFFECTIVE_INPUT_SAMPLERATE: Optional[int] = None
 
+# Which channel to extract from multi-channel devices.
+# For some ReSpeaker firmwares the beamformed/noise-suppressed channel is index 7
+# (0-based) when 8 channels are exposed. Allow override via env var.
+EXTRACT_CHANNEL_INDEX: int = int(os.getenv("RESPEAKER_EXTRACT_CHANNEL", "0"))
+
 # --- Definisi Label untuk Mode Offline dan Online ---
 # Daftar label untuk model OFFLINE (yang sudah dilatih)
 nlp_label_list_offline = [
@@ -273,13 +278,14 @@ def callback(indata, frames, time_info, status):
     if status and status.input_overflow:
         print("PERINGATAN: Input audio overflow! Data audio mungkin hilang.", file=sys.stderr)
     try:
-        # If capturing multi-channel (e.g., ReSpeaker 6ch), extract channel 0
+        # If capturing multi-channel (e.g., ReSpeaker), extract configured channel
         if PREFERRED_INPUT_CHANNELS and PREFERRED_INPUT_CHANNELS > 1:
             # RawInputStream provides bytes; interpret as interleaved int16
             data_i16 = np.frombuffer(indata, dtype=np.int16)
             if data_i16.size % PREFERRED_INPUT_CHANNELS == 0:
-                ch0 = data_i16.reshape(-1, PREFERRED_INPUT_CHANNELS)[:, 0]
-                RUNTIME.ring_buffer.write(ch0.tobytes())
+                ch_idx = max(0, min(EXTRACT_CHANNEL_INDEX, PREFERRED_INPUT_CHANNELS - 1))
+                chx = data_i16.reshape(-1, PREFERRED_INPUT_CHANNELS)[:, ch_idx]
+                RUNTIME.ring_buffer.write(chx.tobytes())
             else:
                 # Fallback: write raw if shape unexpected
                 RUNTIME.ring_buffer.write(bytes(indata))
@@ -338,9 +344,8 @@ def connect_to_wifi(ssid, password):
 
 def find_respeaker_input_device_sd() -> Tuple[Optional[int], int]:
     """Find ReSpeaker input device using sounddevice; return (device_index, channels).
-    - If ReSpeaker found and supports >= 6 channels, use 6 and its index.
-    - Else if ReSpeaker found but fewer channels, use its max_input_channels.
-    - Else return (default_input, 1) or (None, 1) if unknown.
+    Preference order: a dedicated 1-channel processed endpoint (often already beamformed),
+    otherwise the multi-channel endpoint (6 or 8).
     """
     try:
         devices = sd.query_devices()
@@ -348,17 +353,23 @@ def find_respeaker_input_device_sd() -> Tuple[Optional[int], int]:
         chosen_index: Optional[int] = None
         chosen_channels: int = 1
 
-        # Prefer a device with 'ReSpeaker' in its name
+        # Prefer a ReSpeaker device. If multiple entries exist (e.g. 1ch and 8ch endpoints),
+        # pick in this order: 1ch endpoint > highest channel count endpoint.
+        respeaker_candidates: List[Tuple[int, int, str]] = []
         for idx, dev in enumerate(devices):
             name = str(dev.get('name', '')).lower()
             max_in = int(dev.get('max_input_channels', 0) or 0)
             if max_in <= 0:
                 continue
-            if 'respeaker' in name:
-                # Common firmwares expose 6 channels
-                chosen_index = idx
-                chosen_channels = 6 if max_in >= 6 else max_in
-                break
+            if 'respeaker' in name or 'seeed' in name or 'mic array' in name:
+                respeaker_candidates.append((idx, max_in, name))
+
+        if respeaker_candidates:
+            one_ch = [c for c in respeaker_candidates if c[1] == 1]
+            if one_ch:
+                chosen_index, chosen_channels, _ = one_ch[0]
+            else:
+                chosen_index, chosen_channels, _ = sorted(respeaker_candidates, key=lambda t: t[1], reverse=True)[0]
 
         # Fallback to default input device
         if chosen_index is None:
@@ -375,8 +386,8 @@ def find_respeaker_input_device_sd() -> Tuple[Optional[int], int]:
                 chosen_index = None
                 chosen_channels = 1
 
-        # Cap channels at 6 for stability (we only need ch0)
-        chosen_channels = min(max(chosen_channels, 1), 6)
+        # Do not cap here; choose specific extract channel later
+        chosen_channels = max(chosen_channels, 1)
         return chosen_index, chosen_channels
     except Exception as _exc:
         return None, 1
@@ -469,7 +480,7 @@ def select_preferred_input_device():
     """Detect and set the preferred input device and channels.
     Stores results in PREFERRED_INPUT_DEVICE_INDEX and PREFERRED_INPUT_CHANNELS.
     """
-    global PREFERRED_INPUT_DEVICE_INDEX, PREFERRED_INPUT_CHANNELS
+    global PREFERRED_INPUT_DEVICE_INDEX, PREFERRED_INPUT_CHANNELS, EXTRACT_CHANNEL_INDEX
     # Environment override takes precedence if provided
     env_idx = os.getenv("RESPEAKER_INDEX") or os.getenv("AUDIO_INPUT_INDEX")
     env_ch = os.getenv("RESPEAKER_CHANNELS") or os.getenv("AUDIO_INPUT_CHANNELS")
@@ -513,12 +524,15 @@ def select_preferred_input_device():
         name = None
         if dev_idx is not None and 0 <= dev_idx < len(devices):
             name = devices[dev_idx].get('name', 'Unknown')
+        # Smart default: if 8+ channels and no override, assume channel 7 is processed beamformed
+        if os.getenv("RESPEAKER_EXTRACT_CHANNEL") is None and PREFERRED_INPUT_CHANNELS >= 8:
+            EXTRACT_CHANNEL_INDEX = 7
         if name:
-            print(f"Input device terpilih: index={dev_idx}, nama='{name}', channels={PREFERRED_INPUT_CHANNELS}")
+            print(f"Input device terpilih: index={dev_idx}, nama='{name}', channels={PREFERRED_INPUT_CHANNELS}, extract_channel={EXTRACT_CHANNEL_INDEX}")
         else:
-            print(f"Input device terpilih: default (None), channels={PREFERRED_INPUT_CHANNELS}")
+            print(f"Input device terpilih: default (None), channels={PREFERRED_INPUT_CHANNELS}, extract_channel={EXTRACT_CHANNEL_INDEX}")
     except Exception:
-        print(f"Input device terpilih: index={PREFERRED_INPUT_DEVICE_INDEX}, channels={PREFERRED_INPUT_CHANNELS}")
+        print(f"Input device terpilih: index={PREFERRED_INPUT_DEVICE_INDEX}, channels={PREFERRED_INPUT_CHANNELS}, extract_channel={EXTRACT_CHANNEL_INDEX}")
 
 
 def determine_working_input_config() -> Tuple[int, int]:
@@ -562,16 +576,31 @@ def determine_working_input_config() -> Tuple[int, int]:
     # As a last resort, return a very safe default
     return 16000, 1
 
-def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sampling_rate=16000):
-    chunk_duration = 0.5
+def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=0.4, sampling_rate=16000):
+    """Record audio until trailing silence using VAD (if available),
+    with a lower minimum duration so we stop near end-of-speech.
+
+    duration_min: minimum seconds to capture once speech is present
+    duration_max: hard cap on capture seconds
+    silence_duration: trailing non-speech required to stop (seconds)
+    sampling_rate: stream sample rate
+    """
+    try:
+        import webrtcvad  # type: ignore
+        HAVE_VAD = True
+    except Exception:
+        HAVE_VAD = False
+
+    # Use small chunks for better endpointing; VAD prefers 10/20/30ms frames
+    chunk_duration = 0.02 if HAVE_VAD else 0.1
     chunk_samples = int(chunk_duration * sampling_rate)
     total_audio = []
     min_samples = int(duration_min * sampling_rate)
     max_samples = int(duration_max * sampling_rate)
-    silence_threshold = 0.01
+    silence_threshold = 0.01  # fallback for energy-based VAD
     print("Mulai merekam (dinamis)...")
     try:
-        # Use preferred device/channels; extract channel 0 on multi-channel devices (e.g., ReSpeaker)
+        # Use preferred device/channels; extract selected channel on multi-channel devices (e.g., ReSpeaker)
         # Ensure the provided samplerate/channels are valid; if not, fall back
         use_sr, use_ch = sampling_rate, max(1, PREFERRED_INPUT_CHANNELS)
         try:
@@ -584,6 +613,16 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sam
 
         # Ensure chunk size matches the effective samplerate
         chunk_samples = int(chunk_duration * use_sr)
+        # Configure VAD if available and supported samplerate
+        vad = None
+        vad_supported = HAVE_VAD and use_sr in (8000, 16000, 32000, 48000)
+        if vad_supported:
+            try:
+                vad = webrtcvad.Vad(2)  # 0-3 (3 = most aggressive)
+            except Exception:
+                vad = None
+                vad_supported = False
+
         with sd.InputStream(
             samplerate=use_sr,
             channels=use_ch,
@@ -592,50 +631,92 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sam
             device=PREFERRED_INPUT_DEVICE_INDEX,
         ) as stream:
             start_time = time.time()
-            while len(total_audio) < min_samples:
-                if time.time() - start_time > duration_max + 3: # Safety break
-                    print("Perekaman dinamis (min_samples) melebihi batas waktu maksimum.")
+            # Measure ambient level first 200ms to set a dynamic threshold for fallback VAD
+            ambient_frames = []
+            ambient_collect = int(max(1, int(0.2 / chunk_duration)))
+            try:
+                for _ in range(ambient_collect):
+                    amb, _ovf = stream.read(chunk_samples)
+                    ambient_frames.append(amb.copy())
+                ambient = np.concatenate(ambient_frames, axis=0)
+                if use_ch > 1 and ambient.ndim == 2 and ambient.shape[1] >= 1:
+                    ambient_mono = ambient[:, min(EXTRACT_CHANNEL_INDEX, ambient.shape[1]-1)].astype(np.float32)
+                else:
+                    ambient_mono = ambient.flatten()
+                ambient_level = float(np.mean(np.abs(ambient_mono)))
+                silence_threshold = max(0.015, ambient_level * 3.0)
+            except Exception:
+                pass
+
+            # Pre-roll to avoid cutting initial consonants
+            pre_roll: List[np.ndarray] = []
+            pre_roll_seconds = 0.2
+            max_pre_frames = int(pre_roll_seconds / chunk_duration)
+            voiced_started = False
+            voiced_last_time = time.time()
+
+            # Main loop: start writing once voice is detected; stop after min_samples and trailing silence
+            while True:
+                now = time.time()
+                if now - start_time > duration_max + 2.0:
+                    print("Perekaman dinamis melebihi batas waktu maksimum, berhenti.")
                     break
                 try:
                     chunk, overflowed = stream.read(chunk_samples)
                     if overflowed:
-                        print("PERINGATAN: Input audio overflow saat merekam perintah (min_samples loop).", file=sys.stderr)
-                    if use_ch > 1 and chunk.ndim == 2 and chunk.shape[1] >= 1:
-                        total_audio.extend(chunk[:, 0].astype(np.float32))
-                    else:
-                        total_audio.extend(chunk.flatten())
+                        print("PERINGATAN: Input audio overflow saat merekam perintah (loop).", file=sys.stderr)
                 except sd.CallbackStop:
-                    print("Perekaman dinamis (min_samples) dihentikan oleh callback.")
+                    print("Perekaman dinamis dihentikan oleh callback.")
                     break
                 except Exception as e:
-                     print(f"Error saat membaca stream (min_samples): {e}")
-                     break
-
-            last_audio_activity_time = time.time()
-            while len(total_audio) < max_samples:
-                 current_time = time.time()
-                 if current_time - start_time > duration_max + 3: # Safety break
-                     print("Perekaman dinamis (max_samples) melebihi batas waktu maksimum.")
-                     break
-                 if current_time - last_audio_activity_time > silence_duration + chunk_duration: 
-                      print("Deteksi silence (timeout aktivitas), menghentikan perekaman dinamis.")
-                      break
-                 try:
-                    chunk, overflowed = stream.read(chunk_samples)
-                    if overflowed:
-                        print("PERINGATAN: Input audio overflow saat merekam perintah (max_samples loop).", file=sys.stderr)
-                    if use_ch > 1 and chunk.ndim == 2 and chunk.shape[1] >= 1:
-                        total_audio.extend(chunk[:, 0].astype(np.float32))
-                    else:
-                        total_audio.extend(chunk.flatten())
-                    if np.mean(np.abs(chunk)) >= silence_threshold: 
-                        last_audio_activity_time = current_time
-                 except sd.CallbackStop:
-                    print("Perekaman dinamis (max_samples) dihentikan oleh callback.")
+                    print(f"Error saat membaca stream: {e}")
                     break
-                 except Exception as e:
-                     print(f"Error saat membaca stream (max_samples): {e}")
-                     break
+
+                # Extract selected channel
+                if use_ch > 1 and chunk.ndim == 2 and chunk.shape[1] >= 1:
+                    ch_idx = max(0, min(EXTRACT_CHANNEL_INDEX, chunk.shape[1] - 1))
+                    mono = chunk[:, ch_idx].astype(np.float32)
+                else:
+                    mono = chunk.flatten()
+
+                # VAD decision
+                is_voiced = False
+                if vad_supported and vad is not None:
+                    # Convert to 16-bit PCM for VAD, per-frame
+                    bytes16 = np.clip(mono * 32768.0, -32768, 32767).astype(np.int16).tobytes()
+                    is_voiced = vad.is_speech(bytes16, use_sr)
+                else:
+                    is_voiced = float(np.mean(np.abs(mono))) >= silence_threshold
+
+                # Maintain pre-roll buffer until voice starts
+                if not voiced_started:
+                    pre_roll.append(mono)
+                    if len(pre_roll) > max_pre_frames:
+                        pre_roll.pop(0)
+                    if is_voiced:
+                        voiced_started = True
+                        voiced_last_time = now
+                        # Flush pre-roll
+                        for f in pre_roll:
+                            total_audio.extend(f)
+                        pre_roll.clear()
+                    continue
+
+                # Append chunk
+                total_audio.extend(mono)
+                if is_voiced:
+                    voiced_last_time = now
+
+                # Stop if we have recorded at least min_samples and observed trailing silence
+                if len(total_audio) >= min_samples:
+                    if (now - voiced_last_time) >= silence_duration:
+                        print("Deteksi akhir ucapan (silence), menghentikan perekaman dinamis.")
+                        break
+
+                # Hard cap
+                if len(total_audio) >= max_samples:
+                    print("Mencapai durasi maksimum perekaman dinamis, berhenti.")
+                    break
         print("Selesai merekam (dinamis).")
         return np.array(total_audio)
     except sd.PortAudioError as e:
@@ -1583,7 +1664,7 @@ def main() -> None:
                     # Use the same effective samplerate for command recording
                     command_sampling_rate = samplerate
                     recorded_audio_cmd_float32 = record_audio(
-                        duration=3,
+                        duration=1.5,
                         sampling_rate=command_sampling_rate,
                         dynamic=True,
                         noise_reduce=True,
