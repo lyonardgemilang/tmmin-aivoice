@@ -33,7 +33,7 @@ class AssistantConfig:
     decoder_local_dir: Optional[str] = None
     use_esp: bool = True
     # Optional Hailo decoder (avoid HF decoder weights)
-    use_hailo_decoder: bool = False
+    use_hailo_decoder: bool = True
     hailo_decoder_hef: Optional[str] = "base-whisper-decoder-fixed-sequence-matmul-split_h8l.hef"
     hailo_decoder_token_in: Optional[str] = None
     hailo_decoder_encoder_in: Optional[str] = None
@@ -206,11 +206,12 @@ try:
 
         MODELS.hailo_encoder = HailoWhisperEncoder(CONFIG.hailo_encoder_hef, float_output=True)
 
+        # Processor diperlukan untuk ekstraksi fitur mel dan decoding token -> teks
+        # Jika tidak ada direktori lokal, fallback ke model publik "openai/whisper-base" (akan pakai cache bila ada)
         if CONFIG.decoder_local_dir:
             MODELS.hf_processor = AutoProcessor.from_pretrained(CONFIG.decoder_local_dir)
         else:
-            print("FATAL: decoder_local_dir tidak diset. Untuk mode offline penuh, siapkan decoder lokal dan set CONFIG.decoder_local_dir.")
-            sys.exit(1)
+            MODELS.hf_processor = AutoProcessor.from_pretrained("openai/whisper-base")
 
         # Optional Hailo decoder HEF
         MODELS.hailo_decoder = None
@@ -336,6 +337,15 @@ try:
                     .eval()
                     .to("cpu")
                 )
+            else:
+                try:
+                    MODELS.hf_decoder = (
+                        WhisperForConditionalGeneration.from_pretrained("openai/whisper-base")
+                        .eval()
+                        .to("cpu")
+                    )
+                except Exception:
+                    MODELS.hf_decoder = None
             LOGGER.info("STT siap: Hailo encoder + HF decoder (CPU, lokal).")
         else:
             LOGGER.info("STT siap: Hailo encoder + Hailo decoder (HEF).")
