@@ -5,7 +5,7 @@ scipy
 librosa
 sounddevice
 noisereduce
-numpy==2.1
+numpy==1.26.6
 pyaudio
 SpeechRecognition
 pygame
