@@ -1,4 +1,11 @@
-"""Voice assistant entry point using Hailo Whisper encoder (offline only)."""
+"""Voice assistant entry point using Hailo Whisper encoder and offline pipelines only.
+
+Changes:
+- Remove online dependencies (Gemini, Google STT, online wake checks).
+- Force local Whisper (Hugging Face) usage with local_files_only.
+- Remove faster-whisper fallback; use Hailo encoder when available, otherwise CPU decoder.
+- Default to not sending to web server.
+"""
 
 import json
 import logging
@@ -12,14 +19,18 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pygame
 import pyaudio
+import requests
 import serial
 import sounddevice as sd
 import torch
 import noisereduce as nr
+from dotenv import load_dotenv
+from pywifi import PyWiFi, Profile, const
 from scipy.io import wavfile as wav
 from serial.tools import list_ports
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from vosk import KaldiRecognizer, Model
+
 
 logging.basicConfig(level=logging.INFO)
 LOGGER = logging.getLogger(__name__)
@@ -30,15 +41,11 @@ class AssistantConfig:
     use_hailo_encoder: bool = True
     hailo_encoder_hef: str = "base-whisper-encoder-5s_h8l.hef"
     hailo_window_seconds: int = 5
-    decoder_local_dir: Optional[str] = None
+    use_google_stt: bool = False  # Removed online STT; kept for compatibility
+    decoder_local_dir: Optional[str] = None  # Will auto-resolve to local 'whisper-base' if present
+    send_to_webserver: bool = False  # Default disabled to keep fully offline
+    web_server_url: str = "http://10.0.0.76:5000/task"
     use_esp: bool = True
-    # Optional Hailo decoder (avoid HF decoder weights)
-    use_hailo_decoder: bool = True
-    hailo_decoder_hef: Optional[str] = "base-whisper-decoder-fixed-sequence-matmul-split_h8l.hef"
-    hailo_decoder_token_in: Optional[str] = None
-    hailo_decoder_encoder_in: Optional[str] = None
-    hailo_decoder_logits_out: Optional[str] = None
-    max_new_tokens: int = 48
 
 
 @dataclass
@@ -54,7 +61,6 @@ class SpeechModels:
     hailo_encoder: Optional[Any] = None
     hf_processor: Optional[Any] = None
     hf_decoder: Optional[Any] = None
-    hailo_decoder: Optional[Any] = None
 
 
 @dataclass
@@ -133,6 +139,9 @@ MODELS = SpeechModels()
 RUNTIME = AssistantRuntime()
 INTENT_MODELS: Optional[IntentModels] = None
 
+# Keep .env loading for other potential local overrides
+load_dotenv()
+
 try:
     pygame.mixer.init()
 except pygame.error as e:
@@ -140,16 +149,16 @@ except pygame.error as e:
 
 this_file_dir = os.path.dirname(os.path.abspath(__file__))
 
+# Resolve local Whisper base model directory if not set explicitly
+_default_whisper_dir = os.path.abspath(os.path.join(this_file_dir, "..", "whisper-base"))
+if CONFIG.decoder_local_dir is None and os.path.isdir(_default_whisper_dir):
+    CONFIG.decoder_local_dir = _default_whisper_dir
+
 # Preferred input device/channels (auto-detected; used to extract ReSpeaker channel 0)
 PREFERRED_INPUT_DEVICE_INDEX: Optional[int] = None
 PREFERRED_INPUT_CHANNELS: int = 1
 # Effective samplerate chosen for the current input device/channels
 EFFECTIVE_INPUT_SAMPLERATE: Optional[int] = None
-
-# Which channel to extract from multi-channel devices.
-# For some ReSpeaker firmwares the beamformed/noise-suppressed channel is index 7
-# (0-based) when 8 channels are exposed. Allow override via env var.
-EXTRACT_CHANNEL_INDEX: int = int(os.getenv("RESPEAKER_EXTRACT_CHANNEL", "0"))
 
 # --- Definisi Label untuk Mode Offline ---
 # Daftar label untuk model OFFLINE (yang sudah dilatih)
@@ -163,20 +172,20 @@ nlp_label_list_offline = [
 ]
 
 
-# Inisialisasi model NLP
+# Inisialisasi model NLP (offline only, local dir)
 try:
     nlp_model_path = os.path.join(
         this_file_dir,
         "natural_language_processing/mdeberta-intent-classification-final",
     )
-    tokenizer = AutoTokenizer.from_pretrained(nlp_model_path)
-    model = AutoModelForSequenceClassification.from_pretrained(nlp_model_path)
+    tokenizer = AutoTokenizer.from_pretrained(nlp_model_path, local_files_only=True)
+    model = AutoModelForSequenceClassification.from_pretrained(nlp_model_path, local_files_only=True)
     model = model.eval().to("cpu")
     label_map = {idx: label for idx, label in enumerate(nlp_label_list_offline)}
     INTENT_MODELS = IntentModels(tokenizer=tokenizer, model=model, id_to_label=label_map)
-    LOGGER.info("Model NLP berhasil dimuat.")
+    LOGGER.info("Model NLP berhasil dimuat (offline).")
 except Exception as e:
-    print(f"Gagal memuat model NLP: {e}. Program mungkin tidak berfungsi dengan benar.")
+    print(f"Gagal memuat model NLP lokal: {e}. Pastikan direktori model tersedia.")
     sys.exit(1)
 
 # --- Inisialisasi Dataset Exact Match (Lapisan Baru) ---
@@ -198,295 +207,37 @@ except Exception as e:
     print(f"Gagal memuat dataset exact match: {e}. Fitur ini akan dinonaktifkan.")
 
 
-# Inisialisasi STT (Hailo encoder + Hailo decoder HEF optional, else HF decoder CPU)
+"""Inisialisasi STT (Hailo encoder + HF decoder lokal) atau CPU-only decoder"""
 try:
+    from transformers import AutoProcessor, WhisperForConditionalGeneration
+
+    if not CONFIG.decoder_local_dir or not os.path.isdir(CONFIG.decoder_local_dir):
+        raise RuntimeError(
+            f"Direktori model Whisper lokal tidak ditemukan: {CONFIG.decoder_local_dir}. Pastikan 'whisper-base' tersedia."
+        )
+
+    MODELS.hf_processor = AutoProcessor.from_pretrained(CONFIG.decoder_local_dir, local_files_only=True)
+    MODELS.hf_decoder = (
+        WhisperForConditionalGeneration.from_pretrained(CONFIG.decoder_local_dir, local_files_only=True)
+        .eval()
+        .to("cpu")
+    )
+    LOGGER.info("Decoder Whisper lokal berhasil dimuat.")
+
     if CONFIG.use_hailo_encoder:
-        from hailo_whisper import HailoWhisperEncoder
-        from transformers import AutoProcessor, WhisperForConditionalGeneration
+        try:
+            from hailo_whisper import HailoWhisperEncoder
 
-        MODELS.hailo_encoder = HailoWhisperEncoder(CONFIG.hailo_encoder_hef, float_output=True)
-
-        # Processor diperlukan untuk ekstraksi fitur mel dan decoding token -> teks
-        # Jika tidak ada direktori lokal, fallback ke model publik "openai/whisper-base" (akan pakai cache bila ada)
-        if CONFIG.decoder_local_dir:
-            MODELS.hf_processor = AutoProcessor.from_pretrained(CONFIG.decoder_local_dir)
-        else:
-            MODELS.hf_processor = AutoProcessor.from_pretrained("openai/whisper-base")
-
-        # Optional Hailo decoder HEF
-        MODELS.hailo_decoder = None
-        if CONFIG.use_hailo_decoder and CONFIG.hailo_decoder_hef:
-            try:
-                import hailo_platform as hpf
-
-                class HailoWhisperDecoder:
-                    def __init__(self, hef_path: str,
-                                 token_in: Optional[str] = None,
-                                 encoder_in: Optional[str] = None,
-                                 logits_out: Optional[str] = None,
-                                 scheduler: str = "NONE",
-                                 interface: Optional["hpf.HailoStreamInterface"] = None,
-                                 device: Optional["hpf.VDevice"] = None):
-                        self.hef = hpf.HEF(hef_path)
-                        sched_map = {
-                            "NONE": hpf.HailoSchedulingAlgorithm.NONE,
-                            "ROUND_ROBIN": hpf.HailoSchedulingAlgorithm.ROUND_ROBIN,
-                        }
-                        # Reuse an existing VDevice if provided (share with encoder)
-                        if device is not None:
-                            self.device = device
-                            self._own_device = False
-                        else:
-                            vdev_params = hpf.VDevice.create_params()
-                            vdev_params.scheduling_algorithm = sched_map.get(str(scheduler).upper(), hpf.HailoSchedulingAlgorithm.NONE)
-                            # Optional MPS toggle via env var
-                            try:
-                                if str(os.getenv("HAILO_USE_MPS", "0")).strip() in ("1", "true", "True"):
-                                    vdev_params.multi_process_service = True
-                            except Exception:
-                                pass
-                            self.device = hpf.VDevice(params=vdev_params)
-                            self._own_device = True
-                        if interface is None:
-                            interface = hpf.HailoStreamInterface.PCIe
-                        cfg_params = hpf.ConfigureParams.create_from_hef(self.hef, interface=interface)
-                        self.network_group = self.device.configure(self.hef, cfg_params)[0]
-                        self.network_group_params = self.network_group.create_params()
-
-                        ins = self.hef.get_input_vstream_infos()
-                        outs = self.hef.get_output_vstream_infos()
-
-                        def pick_encoder_in():
-                            cand = None
-                            best = -1
-                            for i in ins:
-                                shp = tuple(i.shape)
-                                score = (len(shp) == 3) * (shp[1] * shp[2])
-                                if score > best:
-                                    best, cand = score, i
-                            return cand
-                        def pick_token_in():
-                            cand = None
-                            best = 1e9
-                            for i in ins:
-                                elems = 1
-                                for d in i.shape:
-                                    elems *= int(d)
-                                if elems < best:
-                                    best, cand = elems, i
-                            return cand
-                        def pick_logits_out():
-                            cand = None
-                            best = -1
-                            for o in outs:
-                                shp = tuple(o.shape)
-                                last = shp[-1] if len(shp)>0 else 0
-                                score = last
-                                if score > best:
-                                    best, cand = score, o
-                            return cand
-
-                        self.in_token = next((i for i in ins if i.name == token_in), None) if token_in else None
-                        self.in_encoder = next((i for i in ins if i.name == encoder_in), None) if encoder_in else None
-                        self.out_logits = next((o for o in outs if o.name == logits_out), None) if logits_out else None
-                        if self.in_encoder is None:
-                            self.in_encoder = pick_encoder_in()
-                        if self.in_token is None:
-                            self.in_token = pick_token_in()
-                        if self.out_logits is None:
-                            self.out_logits = pick_logits_out()
-
-                        if not (self.in_encoder and self.in_token and self.out_logits):
-                            print("Hailo decoder HEF stream mapping failed. Available:")
-                            print("Inputs:")
-                            for i in ins:
-                                print(f"  {i.name} shape={i.shape} type={i.format.type}")
-                            print("Outputs:")
-                            for o in outs:
-                                print(f"  {o.name} shape={o.shape} type={o.format.type}")
-                            raise RuntimeError("Cannot auto-map decoder HEF streams; set names in CONFIG.")
-
-                        # Use FLOAT32 on host side to avoid implicit per-frame dtype conversions
-                        self.in_params = hpf.InputVStreamParams.make_from_network_group(
-                            self.network_group, quantized=False, format_type=hpf.FormatType.FLOAT32
-                        )
-                        self.out_params = hpf.OutputVStreamParams.make_from_network_group(
-                            self.network_group, quantized=False, format_type=hpf.FormatType.FLOAT32
-                        )
-
-                        try:
-                            print("[HailoWhisperDecoder] Selected inputs/outputs:")
-                            print(f"  token_in : {self.in_token.name} shape={tuple(self.in_token.shape)}")
-                            print(f"  enc_in   : {self.in_encoder.name} shape={tuple(self.in_encoder.shape)}")
-                            print(f"  logits   : {self.out_logits.name} shape={tuple(self.out_logits.shape)}")
-                        except Exception:
-                            pass
-
-                    def close(self):
-                        # Only release the device if this decoder created it.
-                        if getattr(self, "_own_device", False):
-                            try:
-                                self.device.release()
-                            except Exception:
-                                pass
-
-                    def _prepare_token_input(self, token_id: int) -> np.ndarray:
-                        """
-                        Arrange token input to match decoder's expected shape.
-                        If the decoder expects a vector (e.g., one-hot chunk), build it.
-                        Always return float32 and C-contiguous.
-                        """
-                        shp = tuple(self.in_token.shape)
-                        # Number of elements in one frame (no batch dimension)
-                        elems = 1
-                        for d in shp:
-                            elems *= int(d)
-
-                        # Case A: scalar token id
-                        if elems == 1:
-                            arr = np.array([token_id], dtype=np.float32)
-                            # Add batch/frame dimension if HEF expects one, so final is shape (1,) or (1,1)
-                            if len(shp) == 1:
-                                return arr.reshape((1,)).astype(np.float32, copy=False)
-                            elif len(shp) == 2:
-                                return arr.reshape((1, 1)).astype(np.float32, copy=False)
-                            else:
-                                # Generic: prepend 1s to match rank
-                                out_shape = (1,) * (len(shp) - 1) + (1,)
-                                return arr.reshape(out_shape).astype(np.float32, copy=False)
-
-                        # Case B: vector-like (e.g., one-hot). Put 1.0 at index, 0 elsewhere.
-                        # Determine last dimension size to index into. If flattened, use total elems.
-                        # We map id modulo the vector length to avoid OOB.
-                        vec_len = shp[-1] if len(shp) >= 1 else elems
-                        idx = int(token_id) % int(vec_len)
-                        vec = np.zeros((int(vec_len),), dtype=np.float32)
-                        vec[idx] = 1.0
-
-                        # Now reshape vector into expected frame shape (no batch), then add batch if needed
-                        # Common shapes: (N,), (1,N), (N,1)
-                        if len(shp) == 1 and shp[0] == vec_len:
-                            frame = vec
-                        elif len(shp) == 2 and shp[0] == 1 and shp[1] == vec_len:
-                            frame = vec.reshape((1, vec_len))
-                        elif len(shp) == 2 and shp[0] == vec_len and shp[1] == 1:
-                            frame = vec.reshape((vec_len, 1))
-                        else:
-                            # Fallback: flatten to match total elements
-                            frame = np.zeros(shp, dtype=np.float32)
-                            # Place the '1' at a sensible location along the last axis
-                            slicer = [0] * (len(shp) - 1) + [idx]
-                            frame[tuple(slicer)] = 1.0
-
-                        return np.ascontiguousarray(frame, dtype=np.float32)
-
-                    def _prepare_encoder_input(self, enc_states: np.ndarray) -> np.ndarray:
-                        """
-                        Arrange encoder states [1, T, D] into the vstream's expected frame shape.
-                        Supports common patterns: (1,T,D), (T,D), (1,D,T), (D,T), and channel-last variants.
-                        Returns float32, C-contiguous.
-                        """
-                        x = enc_states
-                        if x.dtype != np.float32:
-                            x = x.astype(np.float32, copy=False)
-                        if x.ndim == 2:
-                            x = np.expand_dims(x, 0)  # [1, T, D]
-                        if x.ndim != 3:
-                            raise ValueError(f"Unexpected encoder states shape {x.shape}, expected [1,T,D]")
-                        _, T, D = x.shape
-                        shp = tuple(self.in_encoder.shape)
-
-                        def add_batch(arr):
-                            # Ensure there's a batch/frame dimension as needed by VStream
-                            if len(shp) == 3:
-                                return arr.astype(np.float32, copy=False)
-                            return np.expand_dims(arr, 0).astype(np.float32, copy=False)
-
-                        # Exact match
-                        if len(shp) == 3 and shp == (1, T, D):
-                            return np.ascontiguousarray(x, dtype=np.float32)
-                        # (T, D)
-                        if len(shp) == 2 and shp == (T, D):
-                            return np.ascontiguousarray(x[0], dtype=np.float32)
-                        # (1, D, T)
-                        if len(shp) == 3 and shp == (1, D, T):
-                            return np.ascontiguousarray(x.transpose(0, 2, 1), dtype=np.float32)
-                        # (D, T)
-                        if len(shp) == 2 and shp == (D, T):
-                            return np.ascontiguousarray(x[0].T, dtype=np.float32)
-                        # (1, T, D, 1)
-                        if len(shp) == 4 and shp == (1, T, D, 1):
-                            return np.ascontiguousarray(np.expand_dims(x, -1), dtype=np.float32)
-                        # (1, D, T, 1)
-                        if len(shp) == 4 and shp == (1, D, T, 1):
-                            return np.ascontiguousarray(np.expand_dims(x.transpose(0, 2, 1), -1), dtype=np.float32)
-
-                        # Fallback: if only the last two dims are swapped in size, try a generic transpose
-                        if len(shp) >= 2 and sorted(shp[-2:]) == sorted((T, D)):
-                            # Build an array matching last two dims order
-                            if shp[-2:] == (T, D):
-                                base = x
-                            else:
-                                base = x.transpose(0, 2, 1)
-                            # Add/remove leading dims to match rank
-                            while base.ndim < len(shp):
-                                base = np.expand_dims(base, 0)
-                            # If extra dims exist in shp with size 1, broadcast by inserting axes
-                            target = np.zeros(shp, dtype=np.float32)
-                            slices = tuple(slice(0, s) for s in base.shape)
-                            target[slices] = base
-                            return np.ascontiguousarray(target, dtype=np.float32)
-
-                        raise ValueError(f"Cannot arrange encoder states [1,{T},{D}] to decoder input {shp}")
-
-                    def step(self, last_token_id: int, enc_states: np.ndarray) -> np.ndarray:
-                        tok = self._prepare_token_input(last_token_id)
-                        enc = self._prepare_encoder_input(enc_states)
-                        with self.network_group.activate(self.network_group_params):
-                            with hpf.InferVStreams(self.network_group, self.in_params, self.out_params) as pipe:
-                                outputs = pipe.infer({
-                                    self.in_token.name: tok,
-                                    self.in_encoder.name: enc,
-                                })
-                        logits = outputs[self.out_logits.name]
-                        return logits
-
-                MODELS.hailo_decoder = HailoWhisperDecoder(
-                    CONFIG.hailo_decoder_hef,
-                    token_in=CONFIG.hailo_decoder_token_in,
-                    encoder_in=CONFIG.hailo_decoder_encoder_in,
-                    logits_out=CONFIG.hailo_decoder_logits_out,
-                    device=MODELS.hailo_encoder.device,
-                )
-                LOGGER.info("Hailo decoder HEF loaded: %s", CONFIG.hailo_decoder_hef)
-            except Exception as dec_e:
-                print(f"PERINGATAN: Gagal memuat Hailo decoder HEF: {dec_e}. Menggunakan HF decoder di CPU.")
-                MODELS.hailo_decoder = None
-
-        # If Hailo decoder not used/failed, use HF decoder (CPU)
-        if MODELS.hailo_decoder is None:
-            if CONFIG.decoder_local_dir:
-                MODELS.hf_decoder = (
-                    WhisperForConditionalGeneration.from_pretrained(CONFIG.decoder_local_dir)
-                    .eval()
-                    .to("cpu")
-                )
-            else:
-                try:
-                    MODELS.hf_decoder = (
-                        WhisperForConditionalGeneration.from_pretrained("openai/whisper-base")
-                        .eval()
-                        .to("cpu")
-                    )
-                except Exception:
-                    MODELS.hf_decoder = None
-            LOGGER.info("STT siap: Hailo encoder + HF decoder (CPU, lokal).")
-        else:
-            LOGGER.info("STT siap: Hailo encoder + Hailo decoder (HEF).")
+            MODELS.hailo_encoder = HailoWhisperEncoder(CONFIG.hailo_encoder_hef, float_output=True)
+            LOGGER.info("STT siap: Hailo encoder (base, %ss) + HF decoder (CPU).", CONFIG.hailo_window_seconds)
+        except Exception as e:
+            MODELS.hailo_encoder = None
+            LOGGER.warning("Gagal inisialisasi Hailo encoder: %s. Menggunakan CPU-only decoder.", e)
     else:
-        raise RuntimeError("CONFIG.use_hailo_encoder is False")
+        MODELS.hailo_encoder = None
+        LOGGER.info("Hailo encoder dinonaktifkan. Menggunakan CPU-only decoder.")
 except Exception as e:
-    print(f"FATAL: Gagal init Hailo encoder/decoder pipeline: {e}")
+    print(f"FATAL: Gagal memuat Whisper lokal: {e}")
     sys.exit(1)
 
 
@@ -497,14 +248,13 @@ def callback(indata, frames, time_info, status):
     if status and status.input_overflow:
         print("PERINGATAN: Input audio overflow! Data audio mungkin hilang.", file=sys.stderr)
     try:
-        # If capturing multi-channel (e.g., ReSpeaker), extract configured channel
+        # If capturing multi-channel (e.g., ReSpeaker 6ch), extract channel 0
         if PREFERRED_INPUT_CHANNELS and PREFERRED_INPUT_CHANNELS > 1:
             # RawInputStream provides bytes; interpret as interleaved int16
             data_i16 = np.frombuffer(indata, dtype=np.int16)
             if data_i16.size % PREFERRED_INPUT_CHANNELS == 0:
-                ch_idx = max(0, min(EXTRACT_CHANNEL_INDEX, PREFERRED_INPUT_CHANNELS - 1))
-                chx = data_i16.reshape(-1, PREFERRED_INPUT_CHANNELS)[:, ch_idx]
-                RUNTIME.ring_buffer.write(chx.tobytes())
+                ch0 = data_i16.reshape(-1, PREFERRED_INPUT_CHANNELS)[:, 0]
+                RUNTIME.ring_buffer.write(ch0.tobytes())
             else:
                 # Fallback: write raw if shape unexpected
                 RUNTIME.ring_buffer.write(bytes(indata))
@@ -518,10 +268,54 @@ def callback(indata, frames, time_info, status):
 
 # --- Utility Functions ---
 
+def connect_to_wifi(ssid, password):
+    wifi = PyWiFi()
+    iface = None
+    try:
+        ifaces = wifi.interfaces()
+        if not ifaces:
+            print("Tidak ada antarmuka Wi-Fi yang ditemukan.")
+            return False
+        iface = ifaces[0]
+    except Exception as e:
+        print(f"Error saat mengakses antarmuka Wi-Fi: {e}")
+        return False
+    try:
+        iface.scan()
+        print("Scanning Wi-Fi...")
+        time.sleep(3)
+        scan_results = iface.scan_results()
+    except Exception as e:
+        print(f"Error saat scan Wi-Fi: {e}")
+        return False
+    for network in scan_results:
+        if network.ssid == ssid:
+            print(f"SSID ditemukan: {ssid}")
+            profile = Profile()
+            profile.ssid = ssid
+            profile.auth = const.AUTH_ALG_OPEN
+            profile.akm.append(const.AKM_TYPE_WPA2PSK)
+            profile.cipher = const.CIPHER_TYPE_CCMP
+            profile.key = password
+            iface.remove_all_network_profiles()
+            temp_profile = iface.add_network_profile(profile)
+            iface.connect(temp_profile)
+            print(f"Mencoba terhubung ke {ssid}...")
+            for _ in range(10):
+                time.sleep(1)
+                if iface.status() == const.IFACE_CONNECTED:
+                    print("Berhasil terhubung ke Wi-Fi!")
+                    return True
+            print(f"Gagal terhubung ke {ssid} setelah beberapa percobaan.")
+            return False
+    print(f"SSID {ssid} tidak ditemukan.")
+    return False
+
 def find_respeaker_input_device_sd() -> Tuple[Optional[int], int]:
     """Find ReSpeaker input device using sounddevice; return (device_index, channels).
-    Preference order: a dedicated 1-channel processed endpoint (often already beamformed),
-    otherwise the multi-channel endpoint (6 or 8).
+    - If ReSpeaker found and supports >= 6 channels, use 6 and its index.
+    - Else if ReSpeaker found but fewer channels, use its max_input_channels.
+    - Else return (default_input, 1) or (None, 1) if unknown.
     """
     try:
         devices = sd.query_devices()
@@ -529,23 +323,17 @@ def find_respeaker_input_device_sd() -> Tuple[Optional[int], int]:
         chosen_index: Optional[int] = None
         chosen_channels: int = 1
 
-        # Prefer a ReSpeaker device. If multiple entries exist (e.g. 1ch and 8ch endpoints),
-        # pick in this order: 1ch endpoint > highest channel count endpoint.
-        respeaker_candidates: List[Tuple[int, int, str]] = []
+        # Prefer a device with 'ReSpeaker' in its name
         for idx, dev in enumerate(devices):
             name = str(dev.get('name', '')).lower()
             max_in = int(dev.get('max_input_channels', 0) or 0)
             if max_in <= 0:
                 continue
-            if 'respeaker' in name or 'seeed' in name or 'mic array' in name:
-                respeaker_candidates.append((idx, max_in, name))
-
-        if respeaker_candidates:
-            one_ch = [c for c in respeaker_candidates if c[1] == 1]
-            if one_ch:
-                chosen_index, chosen_channels, _ = one_ch[0]
-            else:
-                chosen_index, chosen_channels, _ = sorted(respeaker_candidates, key=lambda t: t[1], reverse=True)[0]
+            if 'respeaker' in name:
+                # Common firmwares expose 6 channels
+                chosen_index = idx
+                chosen_channels = 6 if max_in >= 6 else max_in
+                break
 
         # Fallback to default input device
         if chosen_index is None:
@@ -562,13 +350,13 @@ def find_respeaker_input_device_sd() -> Tuple[Optional[int], int]:
                 chosen_index = None
                 chosen_channels = 1
 
-        # Do not cap here; choose specific extract channel later
-        chosen_channels = max(chosen_channels, 1)
+        # Cap channels at 6 for stability (we only need ch0)
+        chosen_channels = min(max(chosen_channels, 1), 6)
         return chosen_index, chosen_channels
     except Exception as _exc:
         return None, 1
 
-# Internet connectivity no longer used (offline mode)
+# No internet checks required; fully offline mode
 
 def find_esp32_port():
     ports = list_ports.comports()
@@ -647,7 +435,7 @@ def select_preferred_input_device():
     """Detect and set the preferred input device and channels.
     Stores results in PREFERRED_INPUT_DEVICE_INDEX and PREFERRED_INPUT_CHANNELS.
     """
-    global PREFERRED_INPUT_DEVICE_INDEX, PREFERRED_INPUT_CHANNELS, EXTRACT_CHANNEL_INDEX
+    global PREFERRED_INPUT_DEVICE_INDEX, PREFERRED_INPUT_CHANNELS
     # Environment override takes precedence if provided
     env_idx = os.getenv("RESPEAKER_INDEX") or os.getenv("AUDIO_INPUT_INDEX")
     env_ch = os.getenv("RESPEAKER_CHANNELS") or os.getenv("AUDIO_INPUT_CHANNELS")
@@ -691,15 +479,12 @@ def select_preferred_input_device():
         name = None
         if dev_idx is not None and 0 <= dev_idx < len(devices):
             name = devices[dev_idx].get('name', 'Unknown')
-        # Smart default: if 8+ channels and no override, assume channel 7 is processed beamformed
-        if os.getenv("RESPEAKER_EXTRACT_CHANNEL") is None and PREFERRED_INPUT_CHANNELS >= 8:
-            EXTRACT_CHANNEL_INDEX = 7
         if name:
-            print(f"Input device terpilih: index={dev_idx}, nama='{name}', channels={PREFERRED_INPUT_CHANNELS}, extract_channel={EXTRACT_CHANNEL_INDEX}")
+            print(f"Input device terpilih: index={dev_idx}, nama='{name}', channels={PREFERRED_INPUT_CHANNELS}")
         else:
-            print(f"Input device terpilih: default (None), channels={PREFERRED_INPUT_CHANNELS}, extract_channel={EXTRACT_CHANNEL_INDEX}")
+            print(f"Input device terpilih: default (None), channels={PREFERRED_INPUT_CHANNELS}")
     except Exception:
-        print(f"Input device terpilih: index={PREFERRED_INPUT_DEVICE_INDEX}, channels={PREFERRED_INPUT_CHANNELS}, extract_channel={EXTRACT_CHANNEL_INDEX}")
+        print(f"Input device terpilih: index={PREFERRED_INPUT_DEVICE_INDEX}, channels={PREFERRED_INPUT_CHANNELS}")
 
 
 def determine_working_input_config() -> Tuple[int, int]:
@@ -743,31 +528,16 @@ def determine_working_input_config() -> Tuple[int, int]:
     # As a last resort, return a very safe default
     return 16000, 1
 
-def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=0.4, sampling_rate=16000):
-    """Record audio until trailing silence using VAD (if available),
-    with a lower minimum duration so we stop near end-of-speech.
-
-    duration_min: minimum seconds to capture once speech is present
-    duration_max: hard cap on capture seconds
-    silence_duration: trailing non-speech required to stop (seconds)
-    sampling_rate: stream sample rate
-    """
-    try:
-        import webrtcvad  # type: ignore
-        HAVE_VAD = True
-    except Exception:
-        HAVE_VAD = False
-
-    # Use small chunks for better endpointing; VAD prefers 10/20/30ms frames
-    chunk_duration = 0.02 if HAVE_VAD else 0.1
+def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sampling_rate=16000):
+    chunk_duration = 0.5
     chunk_samples = int(chunk_duration * sampling_rate)
-    chunks: List[np.ndarray] = []
+    total_audio = []
     min_samples = int(duration_min * sampling_rate)
     max_samples = int(duration_max * sampling_rate)
-    silence_threshold = 0.01  # fallback for energy-based VAD
+    silence_threshold = 0.01
     print("Mulai merekam (dinamis)...")
     try:
-        # Use preferred device/channels; extract selected channel on multi-channel devices (e.g., ReSpeaker)
+        # Use preferred device/channels; extract channel 0 on multi-channel devices (e.g., ReSpeaker)
         # Ensure the provided samplerate/channels are valid; if not, fall back
         use_sr, use_ch = sampling_rate, max(1, PREFERRED_INPUT_CHANNELS)
         try:
@@ -780,16 +550,6 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=0.4, s
 
         # Ensure chunk size matches the effective samplerate
         chunk_samples = int(chunk_duration * use_sr)
-        # Configure VAD if available and supported samplerate
-        vad = None
-        vad_supported = HAVE_VAD and use_sr in (8000, 16000, 32000, 48000)
-        if vad_supported:
-            try:
-                vad = webrtcvad.Vad(2)  # 0-3 (3 = most aggressive)
-            except Exception:
-                vad = None
-                vad_supported = False
-
         with sd.InputStream(
             samplerate=use_sr,
             channels=use_ch,
@@ -798,102 +558,60 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=0.4, s
             device=PREFERRED_INPUT_DEVICE_INDEX,
         ) as stream:
             start_time = time.time()
-            # Measure ambient level first 200ms to set a dynamic threshold for fallback VAD
-            ambient_frames = []
-            ambient_collect = int(max(1, int(0.2 / chunk_duration)))
-            try:
-                for _ in range(ambient_collect):
-                    amb, _ovf = stream.read(chunk_samples)
-                    ambient_frames.append(amb.copy())
-                ambient = np.concatenate(ambient_frames, axis=0)
-                if use_ch > 1 and ambient.ndim == 2 and ambient.shape[1] >= 1:
-                    ambient_mono = ambient[:, min(EXTRACT_CHANNEL_INDEX, ambient.shape[1]-1)].astype(np.float32)
-                else:
-                    ambient_mono = ambient.flatten()
-                ambient_level = float(np.mean(np.abs(ambient_mono)))
-                silence_threshold = max(0.015, ambient_level * 3.0)
-            except Exception:
-                pass
-
-            # Pre-roll to avoid cutting initial consonants
-            pre_roll: List[np.ndarray] = []
-            pre_roll_seconds = 0.2
-            max_pre_frames = int(pre_roll_seconds / chunk_duration)
-            voiced_started = False
-            voiced_last_time = time.time()
-
-            # Main loop: start writing once voice is detected; stop after min_samples and trailing silence
-            while True:
-                now = time.time()
-                if now - start_time > duration_max + 2.0:
-                    print("Perekaman dinamis melebihi batas waktu maksimum, berhenti.")
+            while len(total_audio) < min_samples:
+                if time.time() - start_time > duration_max + 3: # Safety break
+                    print("Perekaman dinamis (min_samples) melebihi batas waktu maksimum.")
                     break
                 try:
                     chunk, overflowed = stream.read(chunk_samples)
                     if overflowed:
-                        print("PERINGATAN: Input audio overflow saat merekam perintah (loop).", file=sys.stderr)
+                        print("PERINGATAN: Input audio overflow saat merekam perintah (min_samples loop).", file=sys.stderr)
+                    if use_ch > 1 and chunk.ndim == 2 and chunk.shape[1] >= 1:
+                        total_audio.extend(chunk[:, 0].astype(np.float32))
+                    else:
+                        total_audio.extend(chunk.flatten())
                 except sd.CallbackStop:
-                    print("Perekaman dinamis dihentikan oleh callback.")
+                    print("Perekaman dinamis (min_samples) dihentikan oleh callback.")
                     break
                 except Exception as e:
-                    print(f"Error saat membaca stream: {e}")
+                     print(f"Error saat membaca stream (min_samples): {e}")
+                     break
+
+            last_audio_activity_time = time.time()
+            while len(total_audio) < max_samples:
+                 current_time = time.time()
+                 if current_time - start_time > duration_max + 3: # Safety break
+                     print("Perekaman dinamis (max_samples) melebihi batas waktu maksimum.")
+                     break
+                 if current_time - last_audio_activity_time > silence_duration + chunk_duration: 
+                      print("Deteksi silence (timeout aktivitas), menghentikan perekaman dinamis.")
+                      break
+                 try:
+                    chunk, overflowed = stream.read(chunk_samples)
+                    if overflowed:
+                        print("PERINGATAN: Input audio overflow saat merekam perintah (max_samples loop).", file=sys.stderr)
+                    if use_ch > 1 and chunk.ndim == 2 and chunk.shape[1] >= 1:
+                        total_audio.extend(chunk[:, 0].astype(np.float32))
+                    else:
+                        total_audio.extend(chunk.flatten())
+                    if np.mean(np.abs(chunk)) >= silence_threshold: 
+                        last_audio_activity_time = current_time
+                 except sd.CallbackStop:
+                    print("Perekaman dinamis (max_samples) dihentikan oleh callback.")
                     break
-
-                # Extract selected channel
-                if use_ch > 1 and chunk.ndim == 2 and chunk.shape[1] >= 1:
-                    ch_idx = max(0, min(EXTRACT_CHANNEL_INDEX, chunk.shape[1] - 1))
-                    mono = chunk[:, ch_idx].astype(np.float32)
-                else:
-                    mono = chunk.flatten()
-
-                # VAD decision
-                is_voiced = False
-                if vad_supported and vad is not None:
-                    # Convert to 16-bit PCM for VAD, per-frame
-                    bytes16 = np.clip(mono * 32768.0, -32768, 32767).astype(np.int16).tobytes()
-                    is_voiced = vad.is_speech(bytes16, use_sr)
-                else:
-                    is_voiced = float(np.mean(np.abs(mono))) >= silence_threshold
-
-                # Maintain pre-roll buffer until voice starts
-                if not voiced_started:
-                    pre_roll.append(mono)
-                    if len(pre_roll) > max_pre_frames:
-                        pre_roll.pop(0)
-                    if is_voiced:
-                        voiced_started = True
-                        voiced_last_time = now
-                        # Flush pre-roll
-                        for f in pre_roll:
-                            chunks.append(f)
-                        pre_roll.clear()
-                    continue
-
-                # Append chunk
-                chunks.append(mono)
-                if is_voiced:
-                    voiced_last_time = now
-
-                # Stop if we have recorded at least min_samples and observed trailing silence
-                if int(sum(len(c) for c in chunks)) >= min_samples:
-                    if (now - voiced_last_time) >= silence_duration:
-                        print("Deteksi akhir ucapan (silence), menghentikan perekaman dinamis.")
-                        break
-
-                # Hard cap
-                if int(sum(len(c) for c in chunks)) >= max_samples:
-                    print("Mencapai durasi maksimum perekaman dinamis, berhenti.")
-                    break
+                 except Exception as e:
+                     print(f"Error saat membaca stream (max_samples): {e}")
+                     break
         print("Selesai merekam (dinamis).")
-        if not chunks:
-            return np.array([])
-        return np.concatenate(chunks, axis=0)
+        return np.array(total_audio)
     except sd.PortAudioError as e:
         print(f"Error SoundDevice saat merekam (dinamis): {e}")
         return np.array([])
     except Exception as e:
         print(f"Error tak terduga saat merekam (dinamis): {e}")
         return np.array([])
+
+# Removed: online STT recognize (Google). Offline transcription is used exclusively.
 
 def record_audio(duration=2, sampling_rate=16000, noise_reduce=True, dynamic=True):
     if dynamic:
@@ -997,9 +715,13 @@ def _fit_to_hailo_window(feats_np, window_seconds):
     return np.concatenate([feats_np, pad], axis=2)
 
 def transcribe_audio(audio_array_float32, sampling_rate=16000, language="Indonesian"):
-    """Transcribe audio with Hailo encoder and either Hailo decoder HEF or HF decoder (CPU)."""
-    if MODELS.hailo_encoder is None or MODELS.hf_processor is None:
-        return {'text': '', 'processing_time': 0}
+    """Transcribe audio via Hailo encoder (if available) or CPU-only Whisper decoder, fully offline."""
+    if audio_array_float32.size == 0:
+        return {"text": "", "processing_time": 0}
+
+    if MODELS.hf_processor is None or MODELS.hf_decoder is None:
+        return {"text": "", "processing_time": 0}
+
     try:
         import time
         import numpy as np
@@ -1008,71 +730,17 @@ def transcribe_audio(audio_array_float32, sampling_rate=16000, language="Indones
         from packaging import version
         from transformers.modeling_outputs import BaseModelOutput
 
-        if audio_array_float32.size == 0:
-            return {'text': '', 'processing_time': 0}
-
         start = time.time()
         processor = MODELS.hf_processor
+        decoder = MODELS.hf_decoder
         inputs = processor(audio_array_float32, sampling_rate=sampling_rate, return_tensors="np")
         feats = inputs["input_features"].astype(np.float32)
 
-        if feats.size == 0 or feats.shape[-1] == 0:
-            feats = np.zeros(
-                (1, 80, int(3000 * CONFIG.hailo_window_seconds / 30)),
-                dtype=np.float32,
-            )
-        feats = _fit_to_hailo_window(feats, CONFIG.hailo_window_seconds)
-        feats = np.ascontiguousarray(feats, dtype=np.float32)
-
-        enc_np = MODELS.hailo_encoder.encode(feats)
-
+        # Prepare generation kwargs
         lang_map = {"Indonesian": "indonesian", "English": "english", "Japanese": "japanese"}
         lang_name = lang_map.get(language, "indonesian")
-
-        # If Hailo decoder is available, run greedy decode on-device
-        if MODELS.hailo_decoder is not None:
-            try:
-                # Get prompt ids (language + task) using the tokenizer
-                if version.parse(transformers.__version__) >= version.parse("4.38.0"):
-                    forced_ids = processor.get_decoder_prompt_ids(language=lang_name, task="transcribe")
-                else:
-                    forced_ids = processor.get_decoder_prompt_ids(language=lang_name, task="transcribe")
-                start_ids = [i[1] if isinstance(i, (list, tuple)) else int(i) for i in forced_ids]
-
-                # Greedy loop using Hailo decoder HEF
-                tokens: List[int] = list(start_ids)
-                eos_id = getattr(getattr(processor, "tokenizer", None), "eos_token_id", None)
-                last_id = tokens[-1]
-                for _ in range(CONFIG.max_new_tokens):
-                    logits = MODELS.hailo_decoder.step(last_id, enc_np)
-                    # Pick last dimension argmax
-                    if logits.ndim > 1:
-                        next_id = int(np.argmax(logits[0]))
-                    else:
-                        next_id = int(np.argmax(logits))
-                    tokens.append(next_id)
-                    last_id = next_id
-                    if eos_id is not None and next_id == eos_id:
-                        break
-
-                # Decode tokens to text via tokenizer
-                if hasattr(processor, "tokenizer"):
-                    text = processor.tokenizer.decode(tokens, skip_special_tokens=True).strip()
-                else:
-                    text = ""
-                return {'text': text, 'processing_time': time.time() - start}
-            except Exception as dec_e:
-                print(f"PERINGATAN: Gagal decode dengan Hailo decoder HEF: {dec_e}. Memakai HF decoder (CPU) bila tersedia.")
-
-        # Fallback to HF decoder on CPU
-        if MODELS.hf_decoder is None:
-            return {'text': '', 'processing_time': 0}
-
-        enc_t = torch.from_numpy(enc_np).to("cpu")
-        enc_out = BaseModelOutput(last_hidden_state=enc_t)
-
         gen_kwargs = dict(
-            max_new_tokens=CONFIG.max_new_tokens,
+            max_new_tokens=48,
             num_beams=1,
             no_repeat_ngram_size=3,
             repetition_penalty=1.15,
@@ -1083,22 +751,43 @@ def transcribe_audio(audio_array_float32, sampling_rate=16000, language="Indones
         if version.parse(transformers.__version__) >= version.parse("4.38.0"):
             gen_kwargs.update({"task": "transcribe", "language": lang_name})
         else:
-            gen_kwargs.update({
-                "forced_decoder_ids": processor.get_decoder_prompt_ids(language=lang_name, task="transcribe")
-            })
-        decoder = MODELS.hf_decoder
+            gen_kwargs.update(
+                {
+                    "forced_decoder_ids": processor.get_decoder_prompt_ids(
+                        language=lang_name, task="transcribe"
+                    )
+                }
+            )
+
         decoder.generation_config.eos_token_id = decoder.config.eos_token_id
         decoder.generation_config.pad_token_id = decoder.config.eos_token_id
         decoder.generation_config.do_sample = False
         decoder.generation_config.temperature = 0.0
 
-        with torch.no_grad():
-            gen_ids = decoder.generate(encoder_outputs=enc_out, **gen_kwargs)
+        # If Hailo encoder available, use it to compute encoder outputs; else run CPU-only via input_features
+        if MODELS.hailo_encoder is not None:
+            if feats.size == 0 or feats.shape[-1] == 0:
+                feats = np.zeros(
+                    (1, 80, int(3000 * CONFIG.hailo_window_seconds / 30)),
+                    dtype=np.float32,
+                )
+            feats = _fit_to_hailo_window(feats, CONFIG.hailo_window_seconds)
+            feats = np.ascontiguousarray(feats, dtype=np.float32)
+
+            enc_np = MODELS.hailo_encoder.encode(feats)
+            enc_t = torch.from_numpy(enc_np).to("cpu")
+            enc_out = BaseModelOutput(last_hidden_state=enc_t)
+            with torch.no_grad():
+                gen_ids = decoder.generate(encoder_outputs=enc_out, **gen_kwargs)
+        else:
+            with torch.no_grad():
+                gen_ids = decoder.generate(input_features=torch.from_numpy(feats).to("cpu"), **gen_kwargs)
+
         text = processor.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
-        return {'text': text, 'processing_time': time.time() - start}
+        return {"text": text, "processing_time": time.time() - start}
     except Exception as e:
-        print(f"Error transcribe_audio: {e}")
-        return {'text': '', 'processing_time': 0}
+        print(f"Error transkripsi offline: {e}")
+        return {"text": "", "processing_time": 0}
 
 
 def predict_intent(text):
@@ -1126,6 +815,23 @@ def predict_intent(text):
             print(f"Error saat prediksi intent offline: {e}")
             return "tidak relevan"
     return predict_offline(text)
+
+def send_to_webserver(command: str) -> bool:
+    if not CONFIG.send_to_webserver:
+        LOGGER.info("Pengiriman ke web server dinonaktifkan.")
+        return True
+    try:
+        params = {'label': command}
+        response = requests.get(CONFIG.web_server_url, params=params)
+        response.raise_for_status()
+        LOGGER.info("Berhasil mengirim ke web server: %s", command)
+        return True
+    except requests.exceptions.Timeout:
+        print("Timeout saat mengirim ke web server.")
+        return False
+    except requests.exceptions.RequestException as exc:
+        print(f"Gagal mengirim ke web server: {exc}")
+        return False
 
 def send_to_esp(command: str) -> bool:
     """Send command to ESP device if configured."""
@@ -1229,7 +935,6 @@ def intent_feedback(intent, predicted_language="Indonesian", main_loop_flag=None
         suffix = "_pria" if STATE.gender == "pria" else ""
         audio_file_to_play = os.path.join(lang_path, f"fitur_belum_didukung{suffix}.mp3")
         STATE.last_command = intent
-    
     elif "wake" in intent: 
         audio_file_to_play = os.path.join(feedback_audio_base_path, "ping_berbicara.mp3")
         pygame.mixer.music.load(audio_file_to_play)
@@ -1385,6 +1090,9 @@ def run_vosk_wake_word_detector(wake_event, vosk_recognizer, main_loop_flag, sam
         print(f"Error pada Vosk wake word detector: {exc}")
 
 
+# Removed online wake word check in offline-only mode
+
+
 def process_command_audio_in_thread(audio_float32_data, language, sampling_rate, relevant_command_event, main_loop_flag_ref):
     thread_id = threading.get_ident()
 
@@ -1395,14 +1103,10 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
         print(f"Thread ID {thread_id}: Relevant command already processed by another thread. Exiting early.")
         return
 
-    text_transcribed = ""
-    stt_processing_time = 0
-
-    # --- STT Phase (offline, Hailo encoder + HF decoder) ---
-    if not main_loop_flag_ref.is_set() or relevant_command_event.is_set(): return
+    # --- STT Phase (offline only) ---
     offline_result_cmd = transcribe_audio(audio_float32_data, sampling_rate=sampling_rate, language=language)
-    text_transcribed = offline_result_cmd["text"]
-    stt_processing_time = offline_result_cmd["processing_time"]
+    text_transcribed = offline_result_cmd.get("text", "")
+    stt_processing_time = offline_result_cmd.get("processing_time", 0)
 
     if not main_loop_flag_ref.is_set() or relevant_command_event.is_set():
         print(f"Thread ID {thread_id}: Exiting after STT phase due to shutdown or relevant command event.")
@@ -1412,15 +1116,17 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
         print(f"Thread ID {thread_id}: Tidak ada teks perintah yang berhasil ditranskripsi.")
         if not relevant_command_event.is_set():
             intent_feedback("tidak relevan", language, main_loop_flag=main_loop_flag_ref)
-        return 
+        return
 
-    print(f"Thread ID {thread_id}: Transkripsi perintah: '{text_transcribed}' (Waktu STT: {stt_processing_time:.2f} dtk, Bahasa: {language})")
+    print(
+        f"Thread ID {thread_id}: Transkripsi perintah: '{text_transcribed}' (Waktu STT: {stt_processing_time:.2f} dtk, Bahasa: {language})"
+    )
 
     # --- Intent Prediction Phase (with Exact Match Layer) ---
     if not main_loop_flag_ref.is_set() or relevant_command_event.is_set():
         print(f"Thread ID {thread_id}: Exiting before Intent Prediction due to shutdown or relevant command event.")
         return
-    
+
     predicted_intent = None
     normalized_text = text_transcribed.lower().strip()
 
@@ -1431,26 +1137,30 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
     if predicted_intent:
         print(f"Thread ID {thread_id}: Intent ditemukan via exact match: '{predicted_intent}'. Melewati NLP.")
     else:
-        # 2. Jika tidak ada, baru panggil model NLP (online/offline)
-        print(f"Thread ID {thread_id}: Tidak ada exact match. Memanggil model NLP...")
+        # 2. Jika tidak ada, baru panggil model NLP offline
+        print(f"Thread ID {thread_id}: Tidak ada exact match. Memanggil model NLP offline...")
         predicted_intent = predict_intent(text_transcribed)
-    
+
     print(f"Thread ID {thread_id}: Prediksi intent final: '{predicted_intent}'")
 
     # --- Feedback Phase & Setting Relevant Event ---
-    if not main_loop_flag_ref.is_set(): 
+    if not main_loop_flag_ref.is_set():
         print(f"Thread ID {thread_id}: Exiting before feedback due to shutdown.")
         return
-    
+
     is_this_thread_winner = False
     if predicted_intent != "tidak relevan":
         if not relevant_command_event.is_set():
             relevant_command_event.set()
             is_this_thread_winner = True
-            print(f"Thread ID {thread_id}: Perintah relevan '{predicted_intent}' diproses. Menandai untuk keluar dari mode perintah (WINNER).")
+            print(
+                f"Thread ID {thread_id}: Perintah relevan '{predicted_intent}' diproses. Menandai untuk keluar dari mode perintah (WINNER)."
+            )
         else:
-            print(f"Thread ID {thread_id}: Perintah relevan '{predicted_intent}' juga ditemukan, tapi event sudah diset oleh thread lain.")
-    
+            print(
+                f"Thread ID {thread_id}: Perintah relevan '{predicted_intent}' juga ditemukan, tapi event sudah diset oleh thread lain."
+            )
+
     play_this_feedback = False
     if is_this_thread_winner:
         play_this_feedback = True
@@ -1458,11 +1168,13 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
         play_this_feedback = True
     elif predicted_intent == "tidak relevan" and not relevant_command_event.is_set():
         play_this_feedback = True
-    
+
     if play_this_feedback:
         intent_feedback(predicted_intent, language, main_loop_flag=main_loop_flag_ref)
     else:
-        print(f"Thread ID {thread_id}: Suppressing 'tidak relevan' feedback as another relevant command was processed or this thread lost the race with a relevant command.")
+        print(
+            f"Thread ID {thread_id}: Suppressing 'tidak relevan' feedback as another relevant command was processed or this thread lost the race with a relevant command."
+        )
 
 
 # --- MAIN PROGRAM ---
@@ -1492,12 +1204,12 @@ def main() -> None:
 
     audio_stream = None
     vosk_thread = None
-    online_check_thread = None  # removed (offline mode)
+    online_check_thread = None
     active_command_threads: List[threading.Thread] = []
 
     try:
         while main_loop_active_flag.is_set():
-            print("\nMenunggu wake word (Offline Vosk kontinu, Online Google STT periodik [id-ID])...")
+            print("\nMenunggu wake word (Offline Vosk kontinu)...")
             wake_word_detected_event = threading.Event()
             detected_language_container = {'language': "Indonesian"}
             RUNTIME.ring_buffer = AudioRingBuffer()
@@ -1574,6 +1286,8 @@ def main() -> None:
                 if vosk_thread.is_alive():
                     print("PERINGATAN: Vosk thread tidak berhenti tepat waktu setelah stop stream.")
 
+            online_check_thread = None
+
             if detected_language_container.get('language') and main_loop_active_flag.is_set():
                 STATE.predicted_language_from_wake_word = detected_language_container['language']
                 print(f"Wake word terdeteksi! Bahasa yang digunakan: {STATE.predicted_language_from_wake_word}")
@@ -1602,7 +1316,7 @@ def main() -> None:
                     # Use the same effective samplerate for command recording
                     command_sampling_rate = samplerate
                     recorded_audio_cmd_float32 = record_audio(
-                        duration=1.5,
+                        duration=3,
                         sampling_rate=command_sampling_rate,
                         dynamic=True,
                         noise_reduce=True,
@@ -1673,7 +1387,7 @@ def main() -> None:
             vosk_thread.join(timeout=2.0)
             if vosk_thread.is_alive():
                 print("PERINGATAN: Vosk thread tidak berhenti tepat waktu saat shutdown.")
-        # no online_check_thread in offline mode
+        # No online check thread in offline mode
 
         final_active_command_threads = [thread for thread in active_command_threads if thread.is_alive()]
         if final_active_command_threads:
