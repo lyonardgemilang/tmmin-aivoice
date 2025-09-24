@@ -306,12 +306,21 @@ try:
                                 print(f"  {o.name} shape={o.shape} type={o.format.type}")
                             raise RuntimeError("Cannot auto-map decoder HEF streams; set names in CONFIG.")
 
+                        # Use FLOAT32 on host side to avoid implicit per-frame dtype conversions
                         self.in_params = hpf.InputVStreamParams.make_from_network_group(
-                            self.network_group, quantized=False, format_type=hpf.FormatType.AUTO
+                            self.network_group, quantized=False, format_type=hpf.FormatType.FLOAT32
                         )
                         self.out_params = hpf.OutputVStreamParams.make_from_network_group(
-                            self.network_group, quantized=False, format_type=hpf.FormatType.AUTO
+                            self.network_group, quantized=False, format_type=hpf.FormatType.FLOAT32
                         )
+
+                        try:
+                            print("[HailoWhisperDecoder] Selected inputs/outputs:")
+                            print(f"  token_in : {self.in_token.name} shape={tuple(self.in_token.shape)}")
+                            print(f"  enc_in   : {self.in_encoder.name} shape={tuple(self.in_encoder.shape)}")
+                            print(f"  logits   : {self.out_logits.name} shape={tuple(self.out_logits.shape)}")
+                        except Exception:
+                            pass
 
                     def close(self):
                         # Only release the device if this decoder created it.
@@ -321,9 +330,118 @@ try:
                             except Exception:
                                 pass
 
+                    def _prepare_token_input(self, token_id: int) -> np.ndarray:
+                        """
+                        Arrange token input to match decoder's expected shape.
+                        If the decoder expects a vector (e.g., one-hot chunk), build it.
+                        Always return float32 and C-contiguous.
+                        """
+                        shp = tuple(self.in_token.shape)
+                        # Number of elements in one frame (no batch dimension)
+                        elems = 1
+                        for d in shp:
+                            elems *= int(d)
+
+                        # Case A: scalar token id
+                        if elems == 1:
+                            arr = np.array([token_id], dtype=np.float32)
+                            # Add batch/frame dimension if HEF expects one, so final is shape (1,) or (1,1)
+                            if len(shp) == 1:
+                                return arr.reshape((1,)).astype(np.float32, copy=False)
+                            elif len(shp) == 2:
+                                return arr.reshape((1, 1)).astype(np.float32, copy=False)
+                            else:
+                                # Generic: prepend 1s to match rank
+                                out_shape = (1,) * (len(shp) - 1) + (1,)
+                                return arr.reshape(out_shape).astype(np.float32, copy=False)
+
+                        # Case B: vector-like (e.g., one-hot). Put 1.0 at index, 0 elsewhere.
+                        # Determine last dimension size to index into. If flattened, use total elems.
+                        # We map id modulo the vector length to avoid OOB.
+                        vec_len = shp[-1] if len(shp) >= 1 else elems
+                        idx = int(token_id) % int(vec_len)
+                        vec = np.zeros((int(vec_len),), dtype=np.float32)
+                        vec[idx] = 1.0
+
+                        # Now reshape vector into expected frame shape (no batch), then add batch if needed
+                        # Common shapes: (N,), (1,N), (N,1)
+                        if len(shp) == 1 and shp[0] == vec_len:
+                            frame = vec
+                        elif len(shp) == 2 and shp[0] == 1 and shp[1] == vec_len:
+                            frame = vec.reshape((1, vec_len))
+                        elif len(shp) == 2 and shp[0] == vec_len and shp[1] == 1:
+                            frame = vec.reshape((vec_len, 1))
+                        else:
+                            # Fallback: flatten to match total elements
+                            frame = np.zeros(shp, dtype=np.float32)
+                            # Place the '1' at a sensible location along the last axis
+                            slicer = [0] * (len(shp) - 1) + [idx]
+                            frame[tuple(slicer)] = 1.0
+
+                        return np.ascontiguousarray(frame, dtype=np.float32)
+
+                    def _prepare_encoder_input(self, enc_states: np.ndarray) -> np.ndarray:
+                        """
+                        Arrange encoder states [1, T, D] into the vstream's expected frame shape.
+                        Supports common patterns: (1,T,D), (T,D), (1,D,T), (D,T), and channel-last variants.
+                        Returns float32, C-contiguous.
+                        """
+                        x = enc_states
+                        if x.dtype != np.float32:
+                            x = x.astype(np.float32, copy=False)
+                        if x.ndim == 2:
+                            x = np.expand_dims(x, 0)  # [1, T, D]
+                        if x.ndim != 3:
+                            raise ValueError(f"Unexpected encoder states shape {x.shape}, expected [1,T,D]")
+                        _, T, D = x.shape
+                        shp = tuple(self.in_encoder.shape)
+
+                        def add_batch(arr):
+                            # Ensure there's a batch/frame dimension as needed by VStream
+                            if len(shp) == 3:
+                                return arr.astype(np.float32, copy=False)
+                            return np.expand_dims(arr, 0).astype(np.float32, copy=False)
+
+                        # Exact match
+                        if len(shp) == 3 and shp == (1, T, D):
+                            return np.ascontiguousarray(x, dtype=np.float32)
+                        # (T, D)
+                        if len(shp) == 2 and shp == (T, D):
+                            return np.ascontiguousarray(x[0], dtype=np.float32)
+                        # (1, D, T)
+                        if len(shp) == 3 and shp == (1, D, T):
+                            return np.ascontiguousarray(x.transpose(0, 2, 1), dtype=np.float32)
+                        # (D, T)
+                        if len(shp) == 2 and shp == (D, T):
+                            return np.ascontiguousarray(x[0].T, dtype=np.float32)
+                        # (1, T, D, 1)
+                        if len(shp) == 4 and shp == (1, T, D, 1):
+                            return np.ascontiguousarray(np.expand_dims(x, -1), dtype=np.float32)
+                        # (1, D, T, 1)
+                        if len(shp) == 4 and shp == (1, D, T, 1):
+                            return np.ascontiguousarray(np.expand_dims(x.transpose(0, 2, 1), -1), dtype=np.float32)
+
+                        # Fallback: if only the last two dims are swapped in size, try a generic transpose
+                        if len(shp) >= 2 and sorted(shp[-2:]) == sorted((T, D)):
+                            # Build an array matching last two dims order
+                            if shp[-2:] == (T, D):
+                                base = x
+                            else:
+                                base = x.transpose(0, 2, 1)
+                            # Add/remove leading dims to match rank
+                            while base.ndim < len(shp):
+                                base = np.expand_dims(base, 0)
+                            # If extra dims exist in shp with size 1, broadcast by inserting axes
+                            target = np.zeros(shp, dtype=np.float32)
+                            slices = tuple(slice(0, s) for s in base.shape)
+                            target[slices] = base
+                            return np.ascontiguousarray(target, dtype=np.float32)
+
+                        raise ValueError(f"Cannot arrange encoder states [1,{T},{D}] to decoder input {shp}")
+
                     def step(self, last_token_id: int, enc_states: np.ndarray) -> np.ndarray:
-                        tok = np.array([[last_token_id]], dtype=np.int32)
-                        enc = enc_states.astype(np.float32, copy=False)
+                        tok = self._prepare_token_input(last_token_id)
+                        enc = self._prepare_encoder_input(enc_states)
                         with self.network_group.activate(self.network_group_params):
                             with hpf.InferVStreams(self.network_group, self.in_params, self.out_params) as pipe:
                                 outputs = pipe.infer({
