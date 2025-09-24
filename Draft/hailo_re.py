@@ -225,15 +225,28 @@ try:
                                  encoder_in: Optional[str] = None,
                                  logits_out: Optional[str] = None,
                                  scheduler: str = "NONE",
-                                 interface: Optional["hpf.HailoStreamInterface"] = None):
+                                 interface: Optional["hpf.HailoStreamInterface"] = None,
+                                 device: Optional["hpf.VDevice"] = None):
                         self.hef = hpf.HEF(hef_path)
-                        vdev_params = hpf.VDevice.create_params()
                         sched_map = {
                             "NONE": hpf.HailoSchedulingAlgorithm.NONE,
                             "ROUND_ROBIN": hpf.HailoSchedulingAlgorithm.ROUND_ROBIN,
                         }
-                        vdev_params.scheduling_algorithm = sched_map.get(str(scheduler).upper(), hpf.HailoSchedulingAlgorithm.NONE)
-                        self.device = hpf.VDevice(params=vdev_params)
+                        # Reuse an existing VDevice if provided (share with encoder)
+                        if device is not None:
+                            self.device = device
+                            self._own_device = False
+                        else:
+                            vdev_params = hpf.VDevice.create_params()
+                            vdev_params.scheduling_algorithm = sched_map.get(str(scheduler).upper(), hpf.HailoSchedulingAlgorithm.NONE)
+                            # Optional MPS toggle via env var
+                            try:
+                                if str(os.getenv("HAILO_USE_MPS", "0")).strip() in ("1", "true", "True"):
+                                    vdev_params.multi_process_service = True
+                            except Exception:
+                                pass
+                            self.device = hpf.VDevice(params=vdev_params)
+                            self._own_device = True
                         if interface is None:
                             interface = hpf.HailoStreamInterface.PCIe
                         cfg_params = hpf.ConfigureParams.create_from_hef(self.hef, interface=interface)
@@ -301,10 +314,12 @@ try:
                         )
 
                     def close(self):
-                        try:
-                            self.device.release()
-                        except Exception:
-                            pass
+                        # Only release the device if this decoder created it.
+                        if getattr(self, "_own_device", False):
+                            try:
+                                self.device.release()
+                            except Exception:
+                                pass
 
                     def step(self, last_token_id: int, enc_states: np.ndarray) -> np.ndarray:
                         tok = np.array([[last_token_id]], dtype=np.int32)
@@ -323,6 +338,7 @@ try:
                     token_in=CONFIG.hailo_decoder_token_in,
                     encoder_in=CONFIG.hailo_decoder_encoder_in,
                     logits_out=CONFIG.hailo_decoder_logits_out,
+                    device=MODELS.hailo_encoder.device,
                 )
                 LOGGER.info("Hailo decoder HEF loaded: %s", CONFIG.hailo_decoder_hef)
             except Exception as dec_e:
