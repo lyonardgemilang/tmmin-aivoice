@@ -190,6 +190,7 @@ except Exception as e:
 
 # --- Inisialisasi Dataset Exact Match (Lapisan Baru) ---
 exact_match_intent_dict = {}
+EXACT_MATCH_ITEMS_NORM: List[Tuple[str, str]] = []  # (normalized_key, label)
 try:
     exact_match_dataset_path = os.path.join(this_file_dir, "natural_language_processing/final_train_data.json")
     with open(exact_match_dataset_path, 'r', encoding='utf-8') as f:
@@ -201,10 +202,104 @@ try:
         exact_match_intent_dict[normalized_text] = item['label']
     
     print(f"Berhasil memuat {len(exact_match_intent_dict)} entri ke kamus exact match.")
+    # Precompute normalized keys for fuzzy matching performance
+    try:
+        EXACT_MATCH_ITEMS_NORM = []
+        for k, label in exact_match_intent_dict.items():
+            kn = None
+            try:
+                kn = k.lower().strip()
+                import re as _re
+                kn = _re.sub(r"[^\w\s]", " ", kn)
+                kn = _re.sub(r"\s+", " ", kn).strip()
+            except Exception:
+                kn = k.lower().strip()
+            EXACT_MATCH_ITEMS_NORM.append((kn, label))
+    except Exception as _e:
+        EXACT_MATCH_ITEMS_NORM = []
 except FileNotFoundError:
     print(f"PERINGATAN: File dataset 'final_train_data.json' tidak ditemukan. Fitur exact match dinonaktifkan.")
 except Exception as e:
     print(f"Gagal memuat dataset exact match: {e}. Fitur ini akan dinonaktifkan.")
+
+
+# --- Fuzzy Matching (Levenshtein) over exact-match phrases -----------------
+def _normalize_for_match(text: str) -> str:
+    import re
+    t = text.lower().strip()
+    # Strip punctuation (keep word chars and spaces), collapse spaces
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def _levenshtein_distance(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if la == 0:
+        return lb
+    if lb == 0:
+        return la
+    # Ensure a is the shorter for memory
+    if la > lb:
+        a, b = b, a
+        la, lb = lb, la
+    prev = list(range(la + 1))
+    for j in range(1, lb + 1):
+        cur = [j] + [0] * la
+        bj = b[j - 1]
+        for i in range(1, la + 1):
+            cost = 0 if a[i - 1] == bj else 1
+            cur[i] = min(
+                cur[i - 1] + 1,      # insertion
+                prev[i] + 1,          # deletion
+                prev[i - 1] + cost,   # substitution
+            )
+        prev = cur
+    return prev[la]
+
+
+def _levenshtein_ratio(a: str, b: str) -> float:
+    # similarity in [0,1]
+    if not a and not b:
+        return 1.0
+    dist = _levenshtein_distance(a, b)
+    denom = max(len(a), len(b))
+    if denom == 0:
+        return 1.0
+    return 1.0 - (dist / denom)
+
+
+def fuzzy_intent_from_exact_match(normalized_text: str, threshold: float = 0.85):
+    """Return best-match intent using Levenshtein ratio over exact-match keys.
+
+    threshold: minimum similarity required to accept a fuzzy match.
+    """
+    try:
+        if not exact_match_intent_dict:
+            return None, 0.0
+        query = _normalize_for_match(normalized_text)
+        best_label = None
+        best_score = 0.0
+        # Iterate once; early heuristic: skip keys too different in length (>2x)
+        iterable = EXACT_MATCH_ITEMS_NORM if EXACT_MATCH_ITEMS_NORM else [( _normalize_for_match(k), label) for k, label in exact_match_intent_dict.items()]
+        for k_norm, label in iterable:
+            # Quick length guard (helps speed, reduces bad matches)
+            lk, lq = len(k_norm), len(query)
+            if lq == 0:
+                continue
+            if lk > 2 * lq or lq > 2 * lk:
+                continue
+            score = _levenshtein_ratio(query, k_norm)
+            if score > best_score:
+                best_score = score
+                best_label = label
+        if best_label is not None and best_score >= threshold:
+            return best_label, best_score
+        return None, best_score
+    except Exception as _e:
+        return None, 0.0
 
 
 """Inisialisasi STT (Hailo encoder + HF decoder lokal) atau CPU-only decoder"""
@@ -1137,9 +1232,15 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
     if predicted_intent:
         print(f"Thread ID {thread_id}: Intent ditemukan via exact match: '{predicted_intent}'. Melewati NLP.")
     else:
-        # 2. Jika tidak ada, baru panggil model NLP offline
-        print(f"Thread ID {thread_id}: Tidak ada exact match. Memanggil model NLP offline...")
-        predicted_intent = predict_intent(text_transcribed)
+        # 2. Jika tidak ada exact, coba fuzzy (Levenshtein) terhadap kamus
+        fuzzy_label, fuzzy_score = fuzzy_intent_from_exact_match(normalized_text, threshold=0.86)
+        if fuzzy_label:
+            predicted_intent = fuzzy_label
+            print(f"Thread ID {thread_id}: Intent ditemukan via fuzzy (Levenshtein={fuzzy_score:.2f}): '{predicted_intent}'. Melewati NLP.")
+        else:
+            # 3. Jika tidak ada, panggil model NLP offline
+            print(f"Thread ID {thread_id}: Tidak ada exact/fuzzy. Memanggil model NLP offline...")
+            predicted_intent = predict_intent(text_transcribed)
 
     print(f"Thread ID {thread_id}: Prediksi intent final: '{predicted_intent}'")
 
