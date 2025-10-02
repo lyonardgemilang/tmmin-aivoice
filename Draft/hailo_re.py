@@ -1280,245 +1280,259 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
 
 # --- MAIN PROGRAM ---
 
+class VoiceAssistantApp:
+    """Object-oriented wrapper around the legacy voice assistant loop.
 
-def main() -> None:
-    main_loop_active_flag = threading.Event()
-    main_loop_active_flag.set()
+    Provides a cleaner entry point while reusing existing helper utilities.
+    """
+    def __init__(self, config: AssistantConfig = CONFIG, state: ProgramState = STATE, models: SpeechModels = MODELS, runtime: AssistantRuntime = RUNTIME) -> None:
+        self.config = config
+        self.state = state
+        self.models = models
+        self.runtime = runtime
 
-    if not initialize_system(main_loop_flag=main_loop_active_flag):
-        print("FATAL: Gagal melakukan inisialisasi sistem. Program berhenti.")
-        sys.exit(1)
+    def run(self) -> None:
+        main_loop_active_flag = threading.Event()
+        main_loop_active_flag.set()
 
-    # Determine a working samplerate/channels for the selected input device
-    try:
-        sr, ch = determine_working_input_config()
-        # Update globals for consistency
-        global EFFECTIVE_INPUT_SAMPLERATE, PREFERRED_INPUT_CHANNELS
-        EFFECTIVE_INPUT_SAMPLERATE = int(sr)
-        PREFERRED_INPUT_CHANNELS = int(ch)
-        print(f"Konfigurasi audio input: samplerate={EFFECTIVE_INPUT_SAMPLERATE} Hz, channels={PREFERRED_INPUT_CHANNELS}.")
-        samplerate = EFFECTIVE_INPUT_SAMPLERATE
-    except Exception as exc:
-        print(f"PERINGATAN: Gagal menentukan konfigurasi input yang valid: {exc}. Menggunakan default 16000 Hz, mono.")
-        samplerate = 16000
-        PREFERRED_INPUT_CHANNELS = 1
+        if not initialize_system(main_loop_flag=main_loop_active_flag):
+            print("FATAL: Gagal melakukan inisialisasi sistem. Program berhenti.")
+            sys.exit(1)
 
-    audio_stream = None
-    vosk_thread = None
-    online_check_thread = None
-    active_command_threads: List[threading.Thread] = []
+        # Determine a working samplerate/channels for the selected input device
+        try:
+            sr, ch = determine_working_input_config()
+            # Update globals for consistency
+            global EFFECTIVE_INPUT_SAMPLERATE, PREFERRED_INPUT_CHANNELS
+            EFFECTIVE_INPUT_SAMPLERATE = int(sr)
+            PREFERRED_INPUT_CHANNELS = int(ch)
+            print(f"Konfigurasi audio input: samplerate={EFFECTIVE_INPUT_SAMPLERATE} Hz, channels={PREFERRED_INPUT_CHANNELS}.")
+            samplerate = EFFECTIVE_INPUT_SAMPLERATE
+        except Exception as exc:
+            print(f"PERINGATAN: Gagal menentukan konfigurasi input yang valid: {exc}. Menggunakan default 16000 Hz, mono.")
+            samplerate = 16000
+            PREFERRED_INPUT_CHANNELS = 1
 
-    try:
-        while main_loop_active_flag.is_set():
-            print("\nMenunggu wake word (Offline Vosk kontinu)...")
-            wake_word_detected_event = threading.Event()
-            detected_language_container = {'language': "Indonesian"}
-            RUNTIME.ring_buffer = AudioRingBuffer()
+        audio_stream = None
+        vosk_thread = None
+        online_check_thread = None
+        active_command_threads: List[threading.Thread] = []
 
-            callback_chunk_duration_sec = 0.2
-            blocksize_callback_samples = int(samplerate * callback_chunk_duration_sec)
+        try:
+            while main_loop_active_flag.is_set():
+                print("\nMenunggu wake word (Offline Vosk kontinu)...")
+                wake_word_detected_event = threading.Event()
+                detected_language_container = {'language': "Indonesian"}
+                self.runtime.ring_buffer = AudioRingBuffer()
 
-            try:
-                # Validate the streaming settings before opening
+                callback_chunk_duration_sec = 0.2
+                blocksize_callback_samples = int(samplerate * callback_chunk_duration_sec)
+
                 try:
-                    sd.check_input_settings(
-                        device=PREFERRED_INPUT_DEVICE_INDEX if PREFERRED_INPUT_DEVICE_INDEX is not None else None,
-                        channels=max(1, PREFERRED_INPUT_CHANNELS),
+                    # Validate the streaming settings before opening
+                    try:
+                        sd.check_input_settings(
+                            device=PREFERRED_INPUT_DEVICE_INDEX if PREFERRED_INPUT_DEVICE_INDEX is not None else None,
+                            channels=max(1, PREFERRED_INPUT_CHANNELS),
+                            samplerate=samplerate,
+                            dtype='int16',
+                        )
+                    except Exception:
+                        # Re-determine working config on-the-fly (device may change)
+                        samplerate, PREFERRED_INPUT_CHANNELS = determine_working_input_config()
+                        print(f"Stream wake word: fallback ke samplerate={samplerate}, channels={PREFERRED_INPUT_CHANNELS}")
+
+                    audio_stream = sd.RawInputStream(
                         samplerate=samplerate,
-                        dtype='int16',
+                        blocksize=int(samplerate * callback_chunk_duration_sec),
+                        device=PREFERRED_INPUT_DEVICE_INDEX,
+                        dtype="int16",
+                        channels=max(1, PREFERRED_INPUT_CHANNELS),
+                        callback=callback,
                     )
-                except Exception:
-                    # Re-determine working config on-the-fly (device may change)
-                    samplerate, PREFERRED_INPUT_CHANNELS = determine_working_input_config()
-                    print(f"Stream wake word: fallback ke samplerate={samplerate}, channels={PREFERRED_INPUT_CHANNELS}")
+                    audio_stream.start()
+                    print("Stream audio dimulai untuk deteksi wake word.")
+                except sd.PortAudioError as port_audio_exc:
+                    if not main_loop_active_flag.is_set():
+                        break
+                    print(f"SoundDevice Error saat memulai stream: {port_audio_exc}. Mencoba lagi dalam 2 detik...")
+                    time.sleep(2)
+                    continue
+                except Exception as stream_exc:
+                    if not main_loop_active_flag.is_set():
+                        break
+                    print(f"Error tak terduga saat memulai stream audio: {stream_exc}. Mencoba lagi dalam 2 detik...")
+                    time.sleep(2)
+                    continue
 
-                audio_stream = sd.RawInputStream(
-                    samplerate=samplerate,
-                    blocksize=int(samplerate * callback_chunk_duration_sec),
-                    device=PREFERRED_INPUT_DEVICE_INDEX,
-                    dtype="int16",
-                    channels=max(1, PREFERRED_INPUT_CHANNELS),
-                    callback=callback,
+                vosk_grammar = json.dumps(
+                    ["hello", "oke", "okay", "hai", "toyota", "moshi", "one", "two", "three", "four", "[unk]"],
+                    ensure_ascii=False,
                 )
-                audio_stream.start()
-                print("Stream audio dimulai untuk deteksi wake word.")
-            except sd.PortAudioError as port_audio_exc:
-                if not main_loop_active_flag.is_set():
+                vosk_recognizer = KaldiRecognizer(self.runtime.wake_model, samplerate, vosk_grammar)
+
+                vosk_thread = threading.Thread(
+                    target=run_vosk_wake_word_detector,
+                    args=(wake_word_detected_event, vosk_recognizer, main_loop_active_flag, samplerate, detected_language_container),
+                    daemon=True,
+                )
+                vosk_thread.start()
+
+                while not wake_word_detected_event.is_set() and main_loop_active_flag.is_set():
+                    time.sleep(0.05)
+
+                if audio_stream and audio_stream.active:
+                    print("Menghentikan stream audio wake word...")
+                    audio_stream.stop()
+                if audio_stream and not audio_stream.closed:
+                    audio_stream.close()
+                    audio_stream = None
+                    print("Stream audio wake word ditutup.")
+
+                wake_word_detected_event.set()
+
+                if vosk_thread and vosk_thread.is_alive():
+                    print("Menunggu Vosk thread selesai...")
+                    vosk_thread.join(timeout=2.0)
+                    if vosk_thread.is_alive():
+                        print("PERINGATAN: Vosk thread tidak berhenti tepat waktu setelah stop stream.")
+
+                online_check_thread = None
+
+                if detected_language_container.get('language') and main_loop_active_flag.is_set():
+                    self.state.predicted_language_from_wake_word = detected_language_container['language']
+                    print(f"Wake word terdeteksi! Bahasa yang digunakan: {self.state.predicted_language_from_wake_word}")
+                    intent_feedback("wake", self.state.predicted_language_from_wake_word, main_loop_flag=main_loop_active_flag)
+
+                    command_mode_timeout = 15
+                    current_predicted_language = self.state.predicted_language_from_wake_word
+
+                    relevant_command_processed_this_session = threading.Event()
+                    command_session_start_time = time.time()
+
+                    active_command_threads = [thread for thread in active_command_threads if thread.is_alive()]
+
+                    while main_loop_active_flag.is_set():
+                        if relevant_command_processed_this_session.is_set():
+                            print("Perintah relevan terdeteksi dan diproses. Keluar dari mode perintah sesi ini.")
+                            break
+
+                        current_loop_time = time.time()
+                        if current_loop_time - command_session_start_time >= command_mode_timeout:
+                            print(f"Waktu mode perintah ({command_mode_timeout} detik) habis.")
+                            break
+
+                        remaining_time = command_mode_timeout - (current_loop_time - command_session_start_time)
+                        print(f"\nSilahkan ucapkan perintah (Bahasa: {current_predicted_language}, Sisa waktu: {remaining_time:.0f} detik)...")
+                        # Use the same effective samplerate for command recording
+                        command_sampling_rate = samplerate
+                        recorded_audio_cmd_float32 = record_audio(
+                            duration=3,
+                            sampling_rate=command_sampling_rate,
+                            dynamic=True,
+                            noise_reduce=True,
+                        )
+
+                        if not main_loop_active_flag.is_set():
+                            break
+
+                        if is_audio_present(recorded_audio_cmd_float32, threshold=0.003):
+                            audio_copy_for_thread = recorded_audio_cmd_float32.copy()
+                            cmd_thread = threading.Thread(
+                                target=process_command_audio_in_thread,
+                                args=(
+                                    audio_copy_for_thread,
+                                    current_predicted_language,
+                                    command_sampling_rate,
+                                    relevant_command_processed_this_session,
+                                    main_loop_active_flag,
+                                ),
+                                daemon=True,
+                            )
+                            cmd_thread.start()
+                            active_command_threads.append(cmd_thread)
+                        else:
+                            print("Tidak ada suara signifikan terdeteksi untuk perintah.")
+
+                        time.sleep(0.1)
+
+                    current_active_threads_after_loop = [thread for thread in active_command_threads if thread.is_alive()]
+                    if current_active_threads_after_loop:
+                        print(
+                            f"Menunggu {len(current_active_threads_after_loop)} thread perintah yang mungkin masih berjalan setelah sesi perintah..."
+                        )
+                        for thread in current_active_threads_after_loop:
+                            thread.join(timeout=1.5)
+                            if thread.is_alive():
+                                print(f"PERINGATAN: Thread perintah ID {thread.ident} tidak berhenti tepat waktu setelah sesi perintah berakhir.")
+                    active_command_threads.clear()
+
+                    if main_loop_active_flag.is_set():
+                        print("Kembali ke mode deteksi wake word.")
+                        intent_feedback("off", current_predicted_language, main_loop_flag=main_loop_active_flag)
+                elif not main_loop_active_flag.is_set():
                     break
-                print(f"SoundDevice Error saat memulai stream: {port_audio_exc}. Mencoba lagi dalam 2 detik...")
-                time.sleep(2)
-                continue
-            except Exception as stream_exc:
-                if not main_loop_active_flag.is_set():
-                    break
-                print(f"Error tak terduga saat memulai stream audio: {stream_exc}. Mencoba lagi dalam 2 detik...")
-                time.sleep(2)
-                continue
+                else:
+                    print("Tidak ada wake word yang terdeteksi dengan jelas atau bahasa tidak ditentukan. Mencoba lagi...")
+                    time.sleep(0.5)
+        except KeyboardInterrupt:
+            print("\nCtrl+C terdeteksi. Menghentikan program...")
+        except Exception as exc_main:
+            print(f"\nError tak terduga di main loop: {exc_main}")
+            import traceback
 
-            vosk_grammar = json.dumps(
-                ["hello", "oke", "okay", "hai", "toyota", "moshi", "one", "two", "three", "four", "[unk]"],
-                ensure_ascii=False,
-            )
-            vosk_recognizer = KaldiRecognizer(RUNTIME.wake_model, samplerate, vosk_grammar)
-
-            vosk_thread = threading.Thread(
-                target=run_vosk_wake_word_detector,
-                args=(wake_word_detected_event, vosk_recognizer, main_loop_active_flag, samplerate, detected_language_container),
-                daemon=True,
-            )
-            vosk_thread.start()
-
-            while not wake_word_detected_event.is_set() and main_loop_active_flag.is_set():
-                time.sleep(0.05)
+            traceback.print_exc()
+        finally:
+            print("Membersihkan resource sebelum keluar...")
+            main_loop_active_flag.clear()
 
             if audio_stream and audio_stream.active:
-                print("Menghentikan stream audio wake word...")
+                print("Menghentikan stream audio final...")
                 audio_stream.stop()
             if audio_stream and not audio_stream.closed:
                 audio_stream.close()
-                audio_stream = None
-                print("Stream audio wake word ditutup.")
-
-            wake_word_detected_event.set()
+                print("Stream audio final ditutup.")
 
             if vosk_thread and vosk_thread.is_alive():
-                print("Menunggu Vosk thread selesai...")
+                print("Menunggu Vosk thread (final)...")
                 vosk_thread.join(timeout=2.0)
                 if vosk_thread.is_alive():
-                    print("PERINGATAN: Vosk thread tidak berhenti tepat waktu setelah stop stream.")
+                    print("PERINGATAN: Vosk thread tidak berhenti tepat waktu saat shutdown.")
+            # No online check thread in offline mode
 
-            online_check_thread = None
-
-            if detected_language_container.get('language') and main_loop_active_flag.is_set():
-                STATE.predicted_language_from_wake_word = detected_language_container['language']
-                print(f"Wake word terdeteksi! Bahasa yang digunakan: {STATE.predicted_language_from_wake_word}")
-                intent_feedback("wake", STATE.predicted_language_from_wake_word, main_loop_flag=main_loop_active_flag)
-
-                command_mode_timeout = 15
-                current_predicted_language = STATE.predicted_language_from_wake_word
-
-                relevant_command_processed_this_session = threading.Event()
-                command_session_start_time = time.time()
-
-                active_command_threads = [thread for thread in active_command_threads if thread.is_alive()]
-
-                while main_loop_active_flag.is_set():
-                    if relevant_command_processed_this_session.is_set():
-                        print("Perintah relevan terdeteksi dan diproses. Keluar dari mode perintah sesi ini.")
-                        break
-
-                    current_loop_time = time.time()
-                    if current_loop_time - command_session_start_time >= command_mode_timeout:
-                        print(f"Waktu mode perintah ({command_mode_timeout} detik) habis.")
-                        break
-
-                    remaining_time = command_mode_timeout - (current_loop_time - command_session_start_time)
-                    print(f"\nSilahkan ucapkan perintah (Bahasa: {current_predicted_language}, Sisa waktu: {remaining_time:.0f} detik)...")
-                    # Use the same effective samplerate for command recording
-                    command_sampling_rate = samplerate
-                    recorded_audio_cmd_float32 = record_audio(
-                        duration=3,
-                        sampling_rate=command_sampling_rate,
-                        dynamic=True,
-                        noise_reduce=True,
-                    )
-
-                    if not main_loop_active_flag.is_set():
-                        break
-
-                    if is_audio_present(recorded_audio_cmd_float32, threshold=0.003):
-                        audio_copy_for_thread = recorded_audio_cmd_float32.copy()
-                        cmd_thread = threading.Thread(
-                            target=process_command_audio_in_thread,
-                            args=(
-                                audio_copy_for_thread,
-                                current_predicted_language,
-                                command_sampling_rate,
-                                relevant_command_processed_this_session,
-                                main_loop_active_flag,
-                            ),
-                            daemon=True,
-                        )
-                        cmd_thread.start()
-                        active_command_threads.append(cmd_thread)
-                    else:
-                        print("Tidak ada suara signifikan terdeteksi untuk perintah.")
-
-                    time.sleep(0.1)
-
-                current_active_threads_after_loop = [thread for thread in active_command_threads if thread.is_alive()]
-                if current_active_threads_after_loop:
-                    print(
-                        f"Menunggu {len(current_active_threads_after_loop)} thread perintah yang mungkin masih berjalan setelah sesi perintah..."
-                    )
-                    for thread in current_active_threads_after_loop:
-                        thread.join(timeout=1.5)
-                        if thread.is_alive():
-                            print(f"PERINGATAN: Thread perintah ID {thread.ident} tidak berhenti tepat waktu setelah sesi perintah berakhir.")
-                active_command_threads.clear()
-
-                if main_loop_active_flag.is_set():
-                    print("Kembali ke mode deteksi wake word.")
-                    intent_feedback("off", current_predicted_language, main_loop_flag=main_loop_active_flag)
-            elif not main_loop_active_flag.is_set():
-                break
-            else:
-                print("Tidak ada wake word yang terdeteksi dengan jelas atau bahasa tidak ditentukan. Mencoba lagi...")
-                time.sleep(0.5)
-    except KeyboardInterrupt:
-        print("\nCtrl+C terdeteksi. Menghentikan program...")
-    except Exception as exc_main:
-        print(f"\nError tak terduga di main loop: {exc_main}")
-        import traceback
-
-        traceback.print_exc()
-    finally:
-        print("Membersihkan resource sebelum keluar...")
-        main_loop_active_flag.clear()
-
-        if audio_stream and audio_stream.active:
-            print("Menghentikan stream audio final...")
-            audio_stream.stop()
-        if audio_stream and not audio_stream.closed:
-            audio_stream.close()
-            print("Stream audio final ditutup.")
-
-        if vosk_thread and vosk_thread.is_alive():
-            print("Menunggu Vosk thread (final)...")
-            vosk_thread.join(timeout=2.0)
-            if vosk_thread.is_alive():
-                print("PERINGATAN: Vosk thread tidak berhenti tepat waktu saat shutdown.")
-        # No online check thread in offline mode
-
-        final_active_command_threads = [thread for thread in active_command_threads if thread.is_alive()]
-        if final_active_command_threads:
-            print(
-                f"Menunggu {len(final_active_command_threads)} thread perintah aktif untuk selesai (final cleanup)..."
-            )
-            for idx, thread in enumerate(final_active_command_threads, start=1):
-                if thread.is_alive():
-                    print(f"  Menunggu thread perintah {idx}/{len(final_active_command_threads)} (ID: {thread.ident})...")
-                    thread.join(timeout=5.0)
+            final_active_command_threads = [thread for thread in active_command_threads if thread.is_alive()]
+            if final_active_command_threads:
+                print(
+                    f"Menunggu {len(final_active_command_threads)} thread perintah aktif untuk selesai (final cleanup)..."
+                )
+                for idx, thread in enumerate(final_active_command_threads, start=1):
                     if thread.is_alive():
-                        print(f"  PERINGATAN: Thread perintah ID {thread.ident} tidak berhenti tepat waktu saat shutdown final.")
-        print("Semua thread perintah yang bisa dijoin telah dijoin (final cleanup).")
+                        print(f"  Menunggu thread perintah {idx}/{len(final_active_command_threads)} (ID: {thread.ident})...")
+                        thread.join(timeout=5.0)
+                        if thread.is_alive():
+                            print(f"  PERINGATAN: Thread perintah ID {thread.ident} tidak berhenti tepat waktu saat shutdown final.")
+            print("Semua thread perintah yang bisa dijoin telah dijoin (final cleanup).")
 
-        if RUNTIME.esp and RUNTIME.esp.is_open:
-            RUNTIME.esp.close()
-            print("Port serial ESP ditutup.")
-        if pygame.mixer.get_init():
-            pygame.mixer.music.stop()
-            pygame.mixer.quit()
-            print("Pygame mixer dihentikan.")
-        print("Program selesai.")
+            if self.runtime.esp and self.runtime.esp.is_open:
+                self.runtime.esp.close()
+                print("Port serial ESP ditutup.")
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+                pygame.mixer.quit()
+                print("Pygame mixer dihentikan.")
+            print("Program selesai.")
 
-        try:
-            if MODELS.hailo_encoder is not None:
-                MODELS.hailo_encoder.close()
-                print("Hailo encoder ditutup.")
-        except Exception:
-            pass
+            try:
+                if self.models.hailo_encoder is not None:
+                    self.models.hailo_encoder.close()
+                    print("Hailo encoder ditutup.")
+            except Exception:
+                pass
 
+
+
+def main() -> None:
+    VoiceAssistantApp().run()
 
 if __name__ == "__main__":
     main()
