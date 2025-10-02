@@ -637,6 +637,128 @@ def predict_intent(is_online: bool, text: str) -> str:
         return predict_intent_online(text)
     return predict_intent_offline(text)
 
+
+# --- Lightweight Context/Rule-Based Parser ---------------------------------
+
+import re
+
+CANONICAL_COLORS = [
+    "merah", "hijau", "biru", "lavender", "magenta", "pink",
+    "violet", "aqua", "kuning", "emas", "abu",
+]
+
+COLOR_SYNONYMS = {
+    "merah": "merah",
+    "hijau": "hijau",
+    "biru": "biru",
+    "ungu": "violet",
+    "ungu tua": "violet",
+    "ungu muda": "lavender",
+    "lavender": "lavender",
+    "magenta": "magenta",
+    "pink": "pink",
+    "violet": "violet",
+    "tosca": "aqua",
+    "aqua": "aqua",
+    "cyan": "aqua",
+    "kuning": "kuning",
+    "emas": "emas",
+    "emas muda": "emas",
+    "abu": "abu",
+    "abu-abu": "abu",
+    # English/code-switch
+    "red": "merah",
+    "green": "hijau",
+    "blue": "biru",
+    "purple": "violet",
+    "gold": "emas",
+    "yellow": "kuning",
+    "gray": "abu",
+    "grey": "abu",
+}
+
+FILLER_WORDS = {"dong", "deh", "nih", "ya", "aja", "kok", "lah"}
+CHANGE_VERBS = {"ganti", "ubah", "switch", "change"}
+TO_PREP = {"ke", "jadi", "to"}
+NEGATION_MARKERS = {"tidak suka", "nggak suka", "ga suka", "gak suka", "kurang suka", "tidak suka sama", "kurang suka sama"}
+
+BRIGHTNESS_UP_PATTERNS = [r"\blebih\s+terang\b", r"\bnaikkan\s+(kecerahan|brightness)\b", r"\btingkatkan\s+(kecerahan|brightness)\b", r"\b(brighten|increase)\s+brightness\b"]
+BRIGHTNESS_DOWN_PATTERNS = [r"\bredup\b", r"\bkurangi\s+(kecerahan|brightness)\b", r"\bturunkan\s+(kecerahan|brightness)\b", r"\b(kurangi|turunkan)\b", r"\b(darken|decrease)\s+brightness\b", r"\blebih\s+gelap\b"]
+
+
+def _normalize_text_basic(text: str) -> str:
+    t = text.lower().strip()
+    tokens = [tok for tok in re.split(r"\s+", t) if tok not in FILLER_WORDS]
+    return " ".join(tokens)
+
+
+def _extract_colors_with_positions(text: str):
+    found = []
+    sorted_syns = sorted(COLOR_SYNONYMS.keys(), key=len, reverse=True)
+    pattern = r"|".join(re.escape(s) for s in sorted_syns)
+    for m in re.finditer(pattern, text):
+        syn = m.group(0)
+        canon = COLOR_SYNONYMS.get(syn)
+        if canon in CANONICAL_COLORS:
+            found.append((canon, m.start()))
+    return found
+
+
+def _contains_any(patterns, text: str) -> bool:
+    return any(re.search(p, text) for p in patterns)
+
+
+def _parse_brightness(text: str) -> Optional[str]:
+    if _contains_any(BRIGHTNESS_UP_PATTERNS, text):
+        return "naikkan kecerahan"
+    if _contains_any(BRIGHTNESS_DOWN_PATTERNS, text):
+        return "turunkan kecerahan"
+    return None
+
+
+def rule_based_context_intent(text: str, state: ProgramState) -> Optional[str]:
+    if not text:
+        return None
+    t = _normalize_text_basic(text)
+
+    br = _parse_brightness(t)
+    if br:
+        return br
+
+    change_present = any(v in t for v in CHANGE_VERBS) or "warna" in t or "lampu" in t
+    colors = _extract_colors_with_positions(t)
+    if not change_present and not colors:
+        return None
+
+    to_positions = []
+    for prep in TO_PREP:
+        for m in re.finditer(rf"\b{re.escape(prep)}\b", t):
+            to_positions.append(m.start())
+    target_color = None
+    if to_positions and colors:
+        min_delta = None
+        candidate = None
+        for tp in to_positions:
+            for c, cpos in colors:
+                if cpos >= tp:
+                    delta = cpos - tp
+                    if min_delta is None or delta < min_delta:
+                        min_delta = delta
+                        candidate = c
+        if candidate:
+            target_color = candidate
+
+    if not target_color and colors:
+        if any(neg in t for neg in NEGATION_MARKERS) and len(colors) >= 2:
+            target_color = colors[-1][0]
+
+    if not target_color and colors:
+        target_color = colors[-1][0]
+
+    if target_color in CANONICAL_COLORS:
+        return f"nyalakan lampu {target_color}"
+    return None
+
 def send_to_webserver(command: str) -> bool:
     if not CONFIG.send_to_webserver:
         LOGGER.info("Pengiriman ke web server dinonaktifkan.")
@@ -1097,9 +1219,15 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
     if predicted_intent:
         print(f"Thread ID {thread_id}: Intent ditemukan via exact match: '{predicted_intent}'. Melewati NLP.")
     else:
-        # 2. Jika tidak ada, baru panggil model NLP (online/offline)
-        print(f"Thread ID {thread_id}: Tidak ada exact match. Memanggil model NLP...")
-        predicted_intent = predict_intent(internet_conn, text_transcribed)
+        # 2. Coba parser rule-based (kontekstual) terlebih dahulu
+        rb_intent = rule_based_context_intent(text_transcribed, STATE)
+        if rb_intent:
+            predicted_intent = rb_intent
+            print(f"Thread ID {thread_id}: Intent ditemukan via rule-based: '{predicted_intent}'. Melewati NLP.")
+        else:
+            # 3. Jika tidak ada, baru panggil model NLP (online/offline)
+            print(f"Thread ID {thread_id}: Tidak ada exact match/rule-based. Memanggil model NLP...")
+            predicted_intent = predict_intent(internet_conn, text_transcribed)
     
     print(f"Thread ID {thread_id}: Prediksi intent final: '{predicted_intent}'")
 

@@ -1058,6 +1058,22 @@ def intent_feedback(intent, predicted_language="Indonesian", main_loop_flag=None
             suffix = "_pria" if STATE.gender == "pria" else ""
             audio_file_to_play = os.path.join(lang_path, f"naikkan_kecerahan{suffix}.mp3")
             STATE.last_command = intent
+    elif "nyalakan humidifier" in intent or "udara segar" in intent:
+        # Turn on humidifier/diffuser via ESP32
+        if send_to_esp("HUMIDIFIER ON") or send_to_esp("FRESH AIR"):
+            # Optional: provide audio feedback if file exists
+            suffix = "_pria" if STATE.gender == "pria" else ""
+            candidate = os.path.join(lang_path, f"nyalakan_humidifier{suffix}.mp3")
+            if os.path.isfile(candidate):
+                audio_file_to_play = candidate
+            STATE.last_command = intent
+    elif "matikan humidifier" in intent:
+        if send_to_esp("HUMIDIFIER OFF") or send_to_esp("STOP FRESH AIR"):
+            suffix = "_pria" if STATE.gender == "pria" else ""
+            candidate = os.path.join(lang_path, f"matikan_humidifier{suffix}.mp3")
+            if os.path.isfile(candidate):
+                audio_file_to_play = candidate
+            STATE.last_command = intent
     elif "tidak relevan" in intent:
         suffix = "_pria" if STATE.gender == "pria" else ""
         print("Perintah tidak dikenali atau tidak ada suara signifikan.")
@@ -1225,8 +1241,9 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
     predicted_intent = None
     normalized_text = text_transcribed.lower().strip()
 
-    # 1. Cek di kamus exact match terlebih dahulu
-    if exact_match_intent_dict:
+    # Japanese/ENG/ID phrase handling moved to final_train_data.json (exact/fuzzy)\r\n
+    # 1. Cek di kamus exact match terlebih dahulu (kecuali sudah terisi oleh hot-phrase)
+    if predicted_intent is None and exact_match_intent_dict:
         predicted_intent = exact_match_intent_dict.get(normalized_text)
 
     if predicted_intent:
