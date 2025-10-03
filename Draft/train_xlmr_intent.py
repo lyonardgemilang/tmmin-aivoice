@@ -206,9 +206,9 @@ def main():
 
     data_collator = DataCollatorWithPadding(tok)
 
-    # Build TrainingArguments adaptively for older Transformers versions
+    # Build TrainingArguments adaptively; prefer epoch-based eval/save
     ta_sig = set(inspect.signature(TrainingArguments.__init__).parameters.keys())
-    ta_kwargs = {
+    base_kwargs = {
         "output_dir": args.output_dir,
         "num_train_epochs": args.epochs,
         "per_device_train_batch_size": args.batch_size,
@@ -220,29 +220,40 @@ def main():
         "logging_steps": 50,
         "fp16": args.fp16,
     }
-    # Newer API keys
-    if "evaluation_strategy" in ta_sig:
-        ta_kwargs["evaluation_strategy"] = "epoch"
-    elif "evaluate_during_training" in ta_sig:
-        ta_kwargs["evaluate_during_training"] = True
-        if "eval_steps" in ta_sig:
-            ta_kwargs["eval_steps"] = 500
-    if "save_strategy" in ta_sig:
-        ta_kwargs["save_strategy"] = "epoch"
-    elif "save_steps" in ta_sig:
-        ta_kwargs["save_steps"] = 500
+    # Optional common extras
     if "save_total_limit" in ta_sig:
-        ta_kwargs["save_total_limit"] = args.save_total_limit
-    if "load_best_model_at_end" in ta_sig:
-        ta_kwargs["load_best_model_at_end"] = True
+        base_kwargs["save_total_limit"] = args.save_total_limit
     if "metric_for_best_model" in ta_sig:
-        ta_kwargs["metric_for_best_model"] = "f1_micro"
+        base_kwargs["metric_for_best_model"] = "f1_micro"
     if "greater_is_better" in ta_sig:
-        ta_kwargs["greater_is_better"] = True
+        base_kwargs["greater_is_better"] = True
     if "report_to" in ta_sig:
-        ta_kwargs["report_to"] = []
+        base_kwargs["report_to"] = []
 
-    training_args = TrainingArguments(**ta_kwargs)
+    # Try epoch strategies first
+    epoch_kwargs = dict(base_kwargs)
+    if "evaluation_strategy" in ta_sig:
+        epoch_kwargs["evaluation_strategy"] = "epoch"
+    if "save_strategy" in ta_sig:
+        epoch_kwargs["save_strategy"] = "epoch"
+    if "load_best_model_at_end" in ta_sig:
+        epoch_kwargs["load_best_model_at_end"] = True
+
+    try:
+        training_args = TrainingArguments(**epoch_kwargs)
+    except Exception:
+        # Fallback for very old versions: use steps + evaluate_during_training
+        steps_kwargs = dict(base_kwargs)
+        if "evaluate_during_training" in ta_sig:
+            steps_kwargs["evaluate_during_training"] = True
+        if "eval_steps" in ta_sig:
+            steps_kwargs["eval_steps"] = 500
+        if "save_steps" in ta_sig:
+            steps_kwargs["save_steps"] = 500
+        # Avoid load_best_model_at_end if strategies can't be aligned
+        if "load_best_model_at_end" in ta_sig:
+            steps_kwargs.pop("load_best_model_at_end", None)
+        training_args = TrainingArguments(**steps_kwargs)
 
     callbacks = []
     if EarlyStoppingCallback is not None:
