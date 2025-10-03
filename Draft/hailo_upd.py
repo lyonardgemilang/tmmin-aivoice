@@ -137,7 +137,8 @@ CONFIG = AssistantConfig()
 STATE = ProgramState()
 MODELS = SpeechModels()
 RUNTIME = AssistantRuntime()
-INTENT_MODELS: Optional[IntentModels] = None
+INTENT_MODELS_PRIMARY: Optional[IntentModels] = None  # XLM-R preferred
+INTENT_MODELS_FALLBACK: Optional[IntentModels] = None  # legacy mDeBERTa (optional)
 
 # Keep .env loading for other potential local overrides
 load_dotenv()
@@ -175,20 +176,20 @@ nlp_label_list_offline = [
 ]
 
 
-# Inisialisasi model NLP (offline only, local dir) - XLM-R preferred
+# Inisialisasi model NLP (offline only) - XLM-R sebagai PRIMARY, mDeBERTa sebagai FALLBACK (opsional)
 try:
-    # Allow overriding via env XLMR_MODEL_DIR; otherwise try common local dirs
-    candidate_dirs = []
+    # PRIMARY: XLM-R from local directory
+    xlmr_candidates = []
     env_dir = os.getenv("XLMR_MODEL_DIR")
     if env_dir:
-        candidate_dirs.append(env_dir)
-    candidate_dirs.extend([
+        xlmr_candidates.append(env_dir)
+    xlmr_candidates.extend([
         os.path.join(this_file_dir, "natural_language_processing/xlmroberta_intent_final"),
         os.path.join(this_file_dir, "natural_language_processing/xlmroberta_base"),
     ])
 
-    load_error = None
-    for model_dir in candidate_dirs:
+    primary_error = None
+    for model_dir in xlmr_candidates:
         try:
             if not os.path.isdir(model_dir):
                 continue
@@ -197,21 +198,41 @@ try:
             model = model.eval().to("cpu")
             id2label = getattr(model.config, "id2label", None)
             if isinstance(id2label, dict) and len(id2label) > 0:
-                # keys may be strings in HF configs; normalize to ints
                 label_map = {int(k): v for k, v in id2label.items()}
             else:
                 label_map = {idx: label for idx, label in enumerate(nlp_label_list_offline)}
-            INTENT_MODELS = IntentModels(tokenizer=tokenizer, model=model, id_to_label=label_map)
-            LOGGER.info("Model NLP (XLM/R) berhasil dimuat dari: %s", model_dir)
+            INTENT_MODELS_PRIMARY = IntentModels(tokenizer=tokenizer, model=model, id_to_label=label_map)
+            LOGGER.info("Model NLP PRIMARY (XLM-R) dimuat dari: %s", model_dir)
             break
         except Exception as _e:
-            load_error = _e
+            primary_error = _e
             continue
-    if INTENT_MODELS is None:
-        raise RuntimeError(load_error or "Tidak menemukan direktori model XLM-R lokal yang valid.")
+    if INTENT_MODELS_PRIMARY is None:
+        raise RuntimeError(primary_error or "Tidak menemukan direktori model XLM-R lokal yang valid.")
 except Exception as e:
-    print(f"Gagal memuat model NLP lokal (XLM-R): {e}. Pastikan direktori model tersedia dan berisi classification head.")
+    print(f"Gagal memuat model NLP PRIMARY (XLM-R): {e}.")
     sys.exit(1)
+
+# FALLBACK (opsional): mDeBERTa local dir, jika tersedia
+try:
+    mdeb_dir = os.path.join(this_file_dir, "natural_language_processing/mdeberta-intent-classification-final")
+    if os.path.isdir(mdeb_dir):
+        try:
+            fb_tok = AutoTokenizer.from_pretrained(mdeb_dir, local_files_only=True)
+            fb_mod = AutoModelForSequenceClassification.from_pretrained(mdeb_dir, local_files_only=True).eval().to("cpu")
+            id2label_fb = getattr(fb_mod.config, "id2label", None)
+            if isinstance(id2label_fb, dict) and len(id2label_fb) > 0:
+                fb_map = {int(k): v for k, v in id2label_fb.items()}
+            else:
+                fb_map = {idx: label for idx, label in enumerate(nlp_label_list_offline)}
+            INTENT_MODELS_FALLBACK = IntentModels(tokenizer=fb_tok, model=fb_mod, id_to_label=fb_map)
+            LOGGER.info("Model NLP FALLBACK (mDeBERTa) dimuat dari: %s", mdeb_dir)
+        except Exception as _e:
+            LOGGER.warning("Gagal memuat model NLP FALLBACK (mDeBERTa): %s", _e)
+    else:
+        LOGGER.info("Model NLP FALLBACK (mDeBERTa) tidak ditemukan; hanya XLM-R yang digunakan.")
+except Exception as e:
+    LOGGER.warning("Gagal inisialisasi fallback NLP: %s", e)
 
 # --- Inisialisasi Dataset Exact Match (Lapisan Baru) ---
 exact_match_intent_dict = {}
@@ -918,17 +939,17 @@ def transcribe_audio(audio_array_float32, sampling_rate=16000, language="Indones
         return {"text": "", "processing_time": 0}
 
 
-def predict_intent_with_confidence(text: str) -> Tuple[str, float, float]:
+def predict_intent_with_confidence(text: str, models: IntentModels) -> Tuple[str, float, float]:
     """Return (label, p1, p2) using the loaded classifier.
 
     p1 = top-1 softmax prob, p2 = runner-up prob. On any failure, returns ('tidak relevan', 0.0, 0.0).
     """
-    if INTENT_MODELS is None:
+    if models is None:
         return "tidak relevan", 0.0, 0.0
     try:
-        tokenizer = INTENT_MODELS.tokenizer
-        model = INTENT_MODELS.model
-        label_map = INTENT_MODELS.id_to_label
+        tokenizer = models.tokenizer
+        model = models.model
+        label_map = models.id_to_label
         inputs = tokenizer(
             text,
             padding=True,
@@ -1303,7 +1324,7 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
     normalized_text = text_transcribed.lower().strip()
 
     # 1) NLP first (XLM-R): accept only if confident
-    label_nlp, p1, p2 = predict_intent_with_confidence(text_transcribed)
+    label_nlp, p1, p2 = predict_intent_with_confidence(text_transcribed, INTENT_MODELS_PRIMARY)
     margin = p1 - p2
     print(f"Thread ID {thread_id}: NLP(XLM-R) => label='{label_nlp}', p1={p1:.2f}, p2={p2:.2f}, margin={margin:.2f}")
 
@@ -1326,11 +1347,19 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
             if fuzzy_label:
                 predicted_intent = fuzzy_label
                 print(f"Thread ID {thread_id}: Intent ditemukan via fuzzy (Levenshtein={fuzzy_score:.2f}): '{predicted_intent}'.")
-        # 4) If still none, consider low-confidence NLP label (but not 'tidak relevan')
+        # 4) If still none, try FALLBACK NLP (mDeBERTa) if available
+        if not predicted_intent and INTENT_MODELS_FALLBACK is not None:
+            fb_label, fb_p1, fb_p2 = predict_intent_with_confidence(text_transcribed, INTENT_MODELS_FALLBACK)
+            fb_margin = fb_p1 - fb_p2
+            print(f"Thread ID {thread_id}: NLP(FALLBACK) => label='{fb_label}', p1={fb_p1:.2f}, p2={fb_p2:.2f}, margin={fb_margin:.2f}")
+            if fb_label != "tidak relevan" and fb_p1 >= 0.60 and fb_margin >= 0.15:
+                predicted_intent = fb_label
+                print("Thread ID {thread_id}: Intent diterima via NLP FALLBACK (confident).")
+        # 5) If still none, consider low-confidence primary NLP label (but not 'tidak relevan')
         if not predicted_intent and label_nlp != "tidak relevan" and p1 >= 0.50:
             predicted_intent = label_nlp
-            print(f"Thread ID {thread_id}: Intent dari NLP diterima meski confidence moderat (p1={p1:.2f}).")
-        # 5) Else default to 'tidak relevan'
+            print(f"Thread ID {thread_id}: Intent dari NLP PRIMARY diterima meski confidence moderat (p1={p1:.2f}).")
+        # 6) Else default to 'tidak relevan'
         if not predicted_intent:
             predicted_intent = "tidak relevan"
 
