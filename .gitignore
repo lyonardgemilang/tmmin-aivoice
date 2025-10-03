@@ -15,6 +15,7 @@ try_whisper_turbo.py
 wav2vec_try.py
 nlp
 .venv
+venv
 main.py
 hailort.log
 pyhailort.log
