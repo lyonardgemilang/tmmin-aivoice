@@ -29,6 +29,7 @@ import argparse
 import json
 import os
 import random
+import inspect
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -172,7 +173,11 @@ def main():
     # Tokenizer & model
     from transformers import (AutoTokenizer, AutoConfig, AutoModelForSequenceClassification,
                               TrainingArguments, Trainer, DataCollatorWithPadding)
-    from transformers.trainer_callback import EarlyStoppingCallback
+    # EarlyStoppingCallback may not exist in older versions
+    try:
+        from transformers.trainer_callback import EarlyStoppingCallback
+    except Exception:
+        EarlyStoppingCallback = None
 
     tok = AutoTokenizer.from_pretrained(args.model_name_or_path, local_files_only=args.local_only)
 
@@ -201,25 +206,50 @@ def main():
 
     data_collator = DataCollatorWithPadding(tok)
 
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
-        save_total_limit=args.save_total_limit,
-        load_best_model_at_end=True,
-        metric_for_best_model="f1_micro",
-        greater_is_better=True,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        learning_rate=args.lr,
-        weight_decay=args.weight_decay,
-        warmup_ratio=args.warmup_ratio,
-        gradient_accumulation_steps=args.grad_accum,
-        logging_steps=50,
-        fp16=args.fp16,
-        report_to=[],
-    )
+    # Build TrainingArguments adaptively for older Transformers versions
+    ta_sig = set(inspect.signature(TrainingArguments.__init__).parameters.keys())
+    ta_kwargs = {
+        "output_dir": args.output_dir,
+        "num_train_epochs": args.epochs,
+        "per_device_train_batch_size": args.batch_size,
+        "per_device_eval_batch_size": args.batch_size,
+        "learning_rate": args.lr,
+        "weight_decay": args.weight_decay,
+        "warmup_ratio": args.warmup_ratio,
+        "gradient_accumulation_steps": args.grad_accum,
+        "logging_steps": 50,
+        "fp16": args.fp16,
+    }
+    # Newer API keys
+    if "evaluation_strategy" in ta_sig:
+        ta_kwargs["evaluation_strategy"] = "epoch"
+    elif "evaluate_during_training" in ta_sig:
+        ta_kwargs["evaluate_during_training"] = True
+        if "eval_steps" in ta_sig:
+            ta_kwargs["eval_steps"] = 500
+    if "save_strategy" in ta_sig:
+        ta_kwargs["save_strategy"] = "epoch"
+    elif "save_steps" in ta_sig:
+        ta_kwargs["save_steps"] = 500
+    if "save_total_limit" in ta_sig:
+        ta_kwargs["save_total_limit"] = args.save_total_limit
+    if "load_best_model_at_end" in ta_sig:
+        ta_kwargs["load_best_model_at_end"] = True
+    if "metric_for_best_model" in ta_sig:
+        ta_kwargs["metric_for_best_model"] = "f1_micro"
+    if "greater_is_better" in ta_sig:
+        ta_kwargs["greater_is_better"] = True
+    if "report_to" in ta_sig:
+        ta_kwargs["report_to"] = []
+
+    training_args = TrainingArguments(**ta_kwargs)
+
+    callbacks = []
+    if EarlyStoppingCallback is not None:
+        try:
+            callbacks.append(EarlyStoppingCallback(early_stopping_patience=2))
+        except Exception:
+            pass
 
     trainer = Trainer(
         model=model,
@@ -229,7 +259,7 @@ def main():
         tokenizer=tok,
         data_collator=data_collator,
         compute_metrics=compute_metrics_builder(),
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+        callbacks=callbacks if callbacks else None,
     )
 
     trainer.train()
@@ -240,4 +270,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
