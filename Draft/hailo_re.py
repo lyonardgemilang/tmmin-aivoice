@@ -147,6 +147,9 @@ try:
 except pygame.error as e:
     print(f"Gagal inisialisasi pygame mixer: {e}. Feedback suara mungkin tidak berfungsi.")
 
+# Serialize all playback to avoid premature stop by overlapping calls
+PLAYBACK_LOCK = threading.Lock()
+
 this_file_dir = os.path.dirname(os.path.abspath(__file__))
 
 # Resolve local Whisper base model directory if not set explicitly
@@ -710,7 +713,13 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sam
 
 def record_audio(duration=2, sampling_rate=16000, noise_reduce=True, dynamic=True):
     if dynamic:
-        audio_data = record_audio_dynamic(duration_min=duration, duration_max=5, silence_duration=1, sampling_rate=sampling_rate)
+        # Give users more pause time before cutoff and allow longer utterances
+        audio_data = record_audio_dynamic(
+            duration_min=duration,
+            duration_max=8,
+            silence_duration=2.5,
+            sampling_rate=sampling_rate,
+        )
     else:
         print(f"Mulai merekam (durasi tetap: {duration} detik)...")
         try:
@@ -963,6 +972,47 @@ def send_to_esp(command: str) -> bool:
         return False
 
 
+def play_audio_blocking(audio_file: str, main_loop_flag: Optional[threading.Event] = None, allow_preempt: bool = False) -> None:
+    """Play an audio file to completion in a serialized, thread-safe way.
+
+    - If `allow_preempt` is True, stop any current playback immediately.
+    - Otherwise, wait for current playback to finish before playing.
+    - Honors `main_loop_flag` to stop early on shutdown.
+    """
+    if not audio_file or not os.path.exists(audio_file):
+        return
+    with PLAYBACK_LOCK:
+        try:
+            if not pygame.mixer.get_init():
+                try:
+                    pygame.mixer.init()
+                except pygame.error as e:
+                    print(f"Gagal inisialisasi mixer saat playback: {e}")
+                    return
+
+            if allow_preempt:
+                if pygame.mixer.music.get_busy():
+                    pygame.mixer.music.stop()
+                    try:
+                        pygame.mixer.music.unload()
+                    except Exception:
+                        pass
+                    time.sleep(0.02)
+            else:
+                while pygame.mixer.music.get_busy() and (main_loop_flag is None or main_loop_flag.is_set()):
+                    time.sleep(0.05)
+
+            pygame.mixer.music.load(audio_file)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy() and (main_loop_flag is None or main_loop_flag.is_set()):
+                time.sleep(0.05)
+            if main_loop_flag is not None and not main_loop_flag.is_set():
+                pygame.mixer.music.stop()
+        except pygame.error as e:
+            print(f"Gagal memainkan file audio '{audio_file}': {e}")
+        except Exception as e:
+            print(f"Error tak terduga saat memainkan audio '{audio_file}': {e}")
+
 def intent_feedback(intent, predicted_language="Indonesian", main_loop_flag=None):
     if intent == STATE.last_command and intent not in ["wake", "off", "system_on"]:
         print(f"Intent '{intent}' sudah dieksekusi sebelumnya dan bukan wake/off/system_on. Mengabaikan feedback audio & ESP.")
@@ -1031,13 +1081,9 @@ def intent_feedback(intent, predicted_language="Indonesian", main_loop_flag=None
         audio_file_to_play = os.path.join(lang_path, f"fitur_belum_didukung{suffix}.mp3")
         STATE.last_command = intent
     elif "wake" in intent: 
-        audio_file_to_play = os.path.join(feedback_audio_base_path, "ping_berbicara.mp3")
-        pygame.mixer.music.load(audio_file_to_play)
-        pygame.mixer.music.play()
-        while pygame.mixer.music.get_busy() and (main_loop_flag is None or main_loop_flag.is_set()): 
-            time.sleep(0.05)
-        if main_loop_flag is not None and not main_loop_flag.is_set(): 
-            pygame.mixer.music.stop()
+        ping_path = os.path.join(feedback_audio_base_path, "ping_berbicara.mp3")
+        # Play wake ping; do not preempt to avoid cutting previous feedback
+        play_audio_blocking(ping_path, main_loop_flag=main_loop_flag, allow_preempt=False)
 
         suffix = "_pria" if STATE.gender == "pria" else ""
         audio_file_to_play = os.path.join(lang_path, f"berbicara{suffix}.mp3")
@@ -1078,24 +1124,9 @@ def intent_feedback(intent, predicted_language="Indonesian", main_loop_flag=None
         suffix = "_pria" if STATE.gender == "pria" else ""
         print("Perintah tidak dikenali atau tidak ada suara signifikan.")
 
-    if audio_file_to_play:
-        if os.path.exists(audio_file_to_play):
-            try:
-                if pygame.mixer.music.get_busy():
-                    pygame.mixer.music.stop()
-                    pygame.mixer.music.unload()
-                    time.sleep(0.05) 
-
-                pygame.mixer.music.load(audio_file_to_play)
-                pygame.mixer.music.play()
-                while pygame.mixer.music.get_busy() and (main_loop_flag is None or main_loop_flag.is_set()): 
-                    time.sleep(0.05)
-                if main_loop_flag is not None and not main_loop_flag.is_set(): 
-                     pygame.mixer.music.stop()
-            except pygame.error as e:
-                print(f"Gagal memainkan file audio '{audio_file_to_play}': {e}")
-            except Exception as e:
-                print(f"Error tak terduga saat memainkan audio: {e}")
+    if audio_file_to_play and os.path.exists(audio_file_to_play):
+        # Do not preempt: let current feedback finish to avoid being cut off
+        play_audio_blocking(audio_file_to_play, main_loop_flag=main_loop_flag, allow_preempt=False)
         else:
             print(f"File audio feedback tidak ditemukan: {audio_file_to_play}")
     elif intent != "tidak relevan" and original_last_command == intent:
