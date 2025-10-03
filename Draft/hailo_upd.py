@@ -627,7 +627,8 @@ def determine_working_input_config() -> Tuple[int, int]:
     return 16000, 1
 
 def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sampling_rate=16000):
-    chunk_duration = 0.5
+    # Smaller chunks improve end-of-speech responsiveness
+    chunk_duration = 0.2
     chunk_samples = int(chunk_duration * sampling_rate)
     total_audio = []
     min_samples = int(duration_min * sampling_rate)
@@ -713,11 +714,11 @@ def record_audio_dynamic(duration_min=3, duration_max=6, silence_duration=1, sam
 
 def record_audio(duration=2, sampling_rate=16000, noise_reduce=True, dynamic=True):
     if dynamic:
-        # Give users more pause time before cutoff and allow longer utterances
+        # Faster response: shorter min duration and moderate silence cutoff
         audio_data = record_audio_dynamic(
             duration_min=duration,
-            duration_max=8,
-            silence_duration=2.5,
+            duration_max=6,
+            silence_duration=0.9,
             sampling_rate=sampling_rate,
         )
     else:
@@ -844,7 +845,8 @@ def transcribe_audio(audio_array_float32, sampling_rate=16000, language="Indones
         lang_map = {"Indonesian": "indonesian", "English": "english", "Japanese": "japanese"}
         lang_name = lang_map.get(language, "indonesian")
         gen_kwargs = dict(
-            max_new_tokens=48,
+            # Short commands decode fast; 32 tokens is plenty
+            max_new_tokens=32,
             num_beams=1,
             no_repeat_ngram_size=3,
             repetition_penalty=1.15,
@@ -1127,7 +1129,7 @@ def intent_feedback(intent, predicted_language="Indonesian", main_loop_flag=None
     if audio_file_to_play and os.path.exists(audio_file_to_play):
         # Do not preempt: let current feedback finish to avoid being cut off
         play_audio_blocking(audio_file_to_play, main_loop_flag=main_loop_flag, allow_preempt=False)
-    elif:
+    elif audio_file_to_play:
         print(f"File audio feedback tidak ditemukan: {audio_file_to_play}")
     elif intent != "tidak relevan" and original_last_command == intent:
         pass
@@ -1475,10 +1477,10 @@ class VoiceAssistantApp:
                         # Use the same effective samplerate for command recording
                         command_sampling_rate = samplerate
                         recorded_audio_cmd_float32 = record_audio(
-                            duration=3,
+                            duration=0.8,
                             sampling_rate=command_sampling_rate,
                             dynamic=True,
-                            noise_reduce=True,
+                            noise_reduce=False,
                         )
 
                         if not main_loop_active_flag.is_set():
