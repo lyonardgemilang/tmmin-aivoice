@@ -15,6 +15,9 @@
 #define COOLING     55  // How much does the fire cool down? Less cooling = hotter fire. (50-100)
 #define SPARKING    120 // Chance (out of 255) that a new spark will be lit. Higher chance = more sparks. (50-200)
 
+// Pin Diffuser Relay
+#define DIFFUSER         2     
+
 CRGB leds[NUM_LEDS];
 bool gReverseDirection = false; // For Fire2012 or other directional animations
 
@@ -43,15 +46,30 @@ void writeHumidifierOutput() {
   digitalWrite(HUMIDIFIER_PIN, level);
 }
 
+// void setHumidifier(bool turnOn) {
+//   const bool stateChanged = humidifierIsOn != turnOn;
+//   humidifierIsOn = turnOn;
+//   writeHumidifierOutput();
+//   Serial.print("Humidifier ");
+//   if (stateChanged) {
+//     Serial.print("turned ");
+//   } else {
+//     Serial.print("remains ");
+//   }
+//   Serial.println(humidifierIsOn ? "ON" : "OFF");
+// }
+
 void setHumidifier(bool turnOn) {
   const bool stateChanged = humidifierIsOn != turnOn;
   humidifierIsOn = turnOn;
   writeHumidifierOutput();
   Serial.print("Humidifier ");
   if (stateChanged) {
-    Serial.print("turned ");
+    Serial.print("Humidifier On ");
+    digitalWrite(12, HIGH);
   } else {
-    Serial.print("remains ");
+    Serial.print("Humidifier Off ");
+    digitalWrite(12, LOW);
   }
   Serial.println(humidifierIsOn ? "ON" : "OFF");
 }
