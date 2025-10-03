@@ -255,8 +255,31 @@ def main():
             steps_kwargs.pop("load_best_model_at_end", None)
         training_args = TrainingArguments(**steps_kwargs)
 
+    # Attach EarlyStopping only if evaluation is actually enabled
+    def _has_active_eval(tr_args) -> bool:
+        try:
+            val = getattr(tr_args, "evaluation_strategy", None)
+            if val is not None and str(val).lower() not in ("no", "none", "intervalstrategy.no"):
+                return True
+        except Exception:
+            pass
+        try:
+            val = getattr(tr_args, "eval_strategy", None)
+            if val is not None and str(val).lower() not in ("no", "none", "intervalstrategy.no"):
+                return True
+        except Exception:
+            pass
+        try:
+            # Very old versions
+            val = getattr(tr_args, "evaluate_during_training", None)
+            if bool(val):
+                return True
+        except Exception:
+            pass
+        return False
+
     callbacks = []
-    if EarlyStoppingCallback is not None:
+    if EarlyStoppingCallback is not None and _has_active_eval(training_args):
         try:
             callbacks.append(EarlyStoppingCallback(early_stopping_patience=2))
         except Exception:
