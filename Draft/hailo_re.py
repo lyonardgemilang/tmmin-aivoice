@@ -1127,8 +1127,8 @@ def intent_feedback(intent, predicted_language="Indonesian", main_loop_flag=None
     if audio_file_to_play and os.path.exists(audio_file_to_play):
         # Do not preempt: let current feedback finish to avoid being cut off
         play_audio_blocking(audio_file_to_play, main_loop_flag=main_loop_flag, allow_preempt=False)
-        else:
-            print(f"File audio feedback tidak ditemukan: {audio_file_to_play}")
+    elif audio_file_to_play:
+        print(f"File audio feedback tidak ditemukan: {audio_file_to_play}")
     elif intent != "tidak relevan" and original_last_command == intent:
         pass
 
