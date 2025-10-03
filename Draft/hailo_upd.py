@@ -175,20 +175,42 @@ nlp_label_list_offline = [
 ]
 
 
-# Inisialisasi model NLP (offline only, local dir)
+# Inisialisasi model NLP (offline only, local dir) - XLM-R preferred
 try:
-    nlp_model_path = os.path.join(
-        this_file_dir,
-        "natural_language_processing/mdeberta-intent-classification-final",
-    )
-    tokenizer = AutoTokenizer.from_pretrained(nlp_model_path, local_files_only=True)
-    model = AutoModelForSequenceClassification.from_pretrained(nlp_model_path, local_files_only=True)
-    model = model.eval().to("cpu")
-    label_map = {idx: label for idx, label in enumerate(nlp_label_list_offline)}
-    INTENT_MODELS = IntentModels(tokenizer=tokenizer, model=model, id_to_label=label_map)
-    LOGGER.info("Model NLP berhasil dimuat (offline).")
+    # Allow overriding via env XLMR_MODEL_DIR; otherwise try common local dirs
+    candidate_dirs = []
+    env_dir = os.getenv("XLMR_MODEL_DIR")
+    if env_dir:
+        candidate_dirs.append(env_dir)
+    candidate_dirs.extend([
+        os.path.join(this_file_dir, "natural_language_processing/xlmroberta_intent_final"),
+        os.path.join(this_file_dir, "natural_language_processing/xlmroberta_base"),
+    ])
+
+    load_error = None
+    for model_dir in candidate_dirs:
+        try:
+            if not os.path.isdir(model_dir):
+                continue
+            tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+            model = AutoModelForSequenceClassification.from_pretrained(model_dir, local_files_only=True)
+            model = model.eval().to("cpu")
+            id2label = getattr(model.config, "id2label", None)
+            if isinstance(id2label, dict) and len(id2label) > 0:
+                # keys may be strings in HF configs; normalize to ints
+                label_map = {int(k): v for k, v in id2label.items()}
+            else:
+                label_map = {idx: label for idx, label in enumerate(nlp_label_list_offline)}
+            INTENT_MODELS = IntentModels(tokenizer=tokenizer, model=model, id_to_label=label_map)
+            LOGGER.info("Model NLP (XLM/R) berhasil dimuat dari: %s", model_dir)
+            break
+        except Exception as _e:
+            load_error = _e
+            continue
+    if INTENT_MODELS is None:
+        raise RuntimeError(load_error or "Tidak menemukan direktori model XLM-R lokal yang valid.")
 except Exception as e:
-    print(f"Gagal memuat model NLP lokal: {e}. Pastikan direktori model tersedia.")
+    print(f"Gagal memuat model NLP lokal (XLM-R): {e}. Pastikan direktori model tersedia dan berisi classification head.")
     sys.exit(1)
 
 # --- Inisialisasi Dataset Exact Match (Lapisan Baru) ---
@@ -896,31 +918,37 @@ def transcribe_audio(audio_array_float32, sampling_rate=16000, language="Indones
         return {"text": "", "processing_time": 0}
 
 
-def predict_intent(text):
-    def predict_offline(text_input):
-        if INTENT_MODELS is None:
-            print("Model NLP belum dimuat. Kembali ke intent 'tidak relevan'.")
-            return "tidak relevan"
-        try:
-            tokenizer = INTENT_MODELS.tokenizer
-            model = INTENT_MODELS.model
-            label_map = INTENT_MODELS.id_to_label
-            inputs = tokenizer(
-                text_input,
-                padding=True,
-                truncation=True,
-                max_length=128,
-                return_tensors="pt",
-            ).to("cpu")
-            with torch.no_grad():
-                outputs = model(**inputs)
-            logits = outputs.logits
-            pred_id = torch.argmax(logits, dim=-1).item()
-            return label_map[pred_id]
-        except Exception as e:
-            print(f"Error saat prediksi intent offline: {e}")
-            return "tidak relevan"
-    return predict_offline(text)
+def predict_intent_with_confidence(text: str) -> Tuple[str, float, float]:
+    """Return (label, p1, p2) using the loaded classifier.
+
+    p1 = top-1 softmax prob, p2 = runner-up prob. On any failure, returns ('tidak relevan', 0.0, 0.0).
+    """
+    if INTENT_MODELS is None:
+        return "tidak relevan", 0.0, 0.0
+    try:
+        tokenizer = INTENT_MODELS.tokenizer
+        model = INTENT_MODELS.model
+        label_map = INTENT_MODELS.id_to_label
+        inputs = tokenizer(
+            text,
+            padding=True,
+            truncation=True,
+            max_length=128,
+            return_tensors="pt",
+        ).to("cpu")
+        with torch.no_grad():
+            outputs = model(**inputs)
+        logits = outputs.logits
+        probs = torch.nn.functional.softmax(logits, dim=-1).squeeze(0)
+        top2 = torch.topk(probs, k=min(2, probs.numel()))
+        p1 = float(top2.values[0].item()) if top2.values.numel() > 0 else 0.0
+        p2 = float(top2.values[1].item()) if top2.values.numel() > 1 else 0.0
+        pred_id = int(torch.argmax(probs, dim=-1).item())
+        label = label_map.get(pred_id, "tidak relevan")
+        return label, p1, p2
+    except Exception as e:
+        print(f"Error saat prediksi intent offline (XLMR): {e}")
+        return "tidak relevan", 0.0, 0.0
 
 def send_to_webserver(command: str) -> bool:
     if not CONFIG.send_to_webserver:
@@ -1266,7 +1294,7 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
         f"Thread ID {thread_id}: Transkripsi perintah: '{text_transcribed}' (Waktu STT: {stt_processing_time:.2f} dtk, Bahasa: {language})"
     )
 
-    # --- Intent Prediction Phase (with Exact Match Layer) ---
+    # --- Intent Prediction Phase (NLP-first with fallback to exact/fuzzy) ---
     if not main_loop_flag_ref.is_set() or relevant_command_event.is_set():
         print(f"Thread ID {thread_id}: Exiting before Intent Prediction due to shutdown or relevant command event.")
         return
@@ -1274,23 +1302,37 @@ def process_command_audio_in_thread(audio_float32_data, language, sampling_rate,
     predicted_intent = None
     normalized_text = text_transcribed.lower().strip()
 
-    # Japanese/ENG/ID phrase handling moved to final_train_data.json (exact/fuzzy)\r\n
-    # 1. Cek di kamus exact match terlebih dahulu (kecuali sudah terisi oleh hot-phrase)
-    if predicted_intent is None and exact_match_intent_dict:
-        predicted_intent = exact_match_intent_dict.get(normalized_text)
+    # 1) NLP first (XLM-R): accept only if confident
+    label_nlp, p1, p2 = predict_intent_with_confidence(text_transcribed)
+    margin = p1 - p2
+    print(f"Thread ID {thread_id}: NLP(XLM-R) => label='{label_nlp}', p1={p1:.2f}, p2={p2:.2f}, margin={margin:.2f}")
 
-    if predicted_intent:
-        print(f"Thread ID {thread_id}: Intent ditemukan via exact match: '{predicted_intent}'. Melewati NLP.")
+    ACCEPT_P1 = 0.65
+    ACCEPT_MARGIN = 0.20
+
+    if label_nlp != "tidak relevan" and p1 >= ACCEPT_P1 and margin >= ACCEPT_MARGIN:
+        predicted_intent = label_nlp
+        print(f"Thread ID {thread_id}: Intent diterima via NLP (confident).")
     else:
-        # 2. Jika tidak ada exact, coba fuzzy (Levenshtein) terhadap kamus
-        fuzzy_label, fuzzy_score = fuzzy_intent_from_exact_match(normalized_text, threshold=0.86)
-        if fuzzy_label:
-            predicted_intent = fuzzy_label
-            print(f"Thread ID {thread_id}: Intent ditemukan via fuzzy (Levenshtein={fuzzy_score:.2f}): '{predicted_intent}'. Melewati NLP.")
-        else:
-            # 3. Jika tidak ada, panggil model NLP offline
-            print(f"Thread ID {thread_id}: Tidak ada exact/fuzzy. Memanggil model NLP offline...")
-            predicted_intent = predict_intent(text_transcribed)
+        # 2) Exact match fallback
+        if exact_match_intent_dict:
+            em_label = exact_match_intent_dict.get(normalized_text)
+            if em_label:
+                predicted_intent = em_label
+                print(f"Thread ID {thread_id}: Intent ditemukan via exact match: '{predicted_intent}'.")
+        # 3) Fuzzy fallback if still none
+        if not predicted_intent:
+            fuzzy_label, fuzzy_score = fuzzy_intent_from_exact_match(normalized_text, threshold=0.86)
+            if fuzzy_label:
+                predicted_intent = fuzzy_label
+                print(f"Thread ID {thread_id}: Intent ditemukan via fuzzy (Levenshtein={fuzzy_score:.2f}): '{predicted_intent}'.")
+        # 4) If still none, consider low-confidence NLP label (but not 'tidak relevan')
+        if not predicted_intent and label_nlp != "tidak relevan" and p1 >= 0.50:
+            predicted_intent = label_nlp
+            print(f"Thread ID {thread_id}: Intent dari NLP diterima meski confidence moderat (p1={p1:.2f}).")
+        # 5) Else default to 'tidak relevan'
+        if not predicted_intent:
+            predicted_intent = "tidak relevan"
 
     print(f"Thread ID {thread_id}: Prediksi intent final: '{predicted_intent}'")
 
